@@ -1,0 +1,454 @@
+/*
+ * Sakhi — ASHA worker console.
+ *
+ * Design constraints, all driven by the Bidar field context rather than taste:
+ *
+ * 1. Kannada is the primary language, English is a small subtitle. Kannada
+ *    glyphs need more vertical room than Latin, hence the generous line-height
+ *    on every text token.
+ * 2. Touch targets are >=64px. ASHA workers use this one-handed, outdoors,
+ *    often while holding a register or a baby.
+ * 3. State is never communicated by colour alone — every state carries an
+ *    icon, a colour AND a Kannada word, because the app has to work for a user
+ *    with low text literacy and for one with colour-vision deficiency.
+ * 4. Contrast is high and backgrounds are warm off-white, not pure white:
+ *    cheap Android panels in direct sunlight wash out low-contrast greys.
+ * 5. No thin font weights anywhere. They disappear on low-DPI screens.
+ * 6. The log panel is deliberately quiet — small, muted, collapsible. It is a
+ *    supervisor/debug affordance and must never compete with the call.
+ */
+
+/*
+ * Clinical identity palette (2026-09-04): Pure White canvas / Deep Navy ink /
+ * Saffron Orange accent, replacing the earlier warm-cream/teal set below.
+ * --sk-bg is a soft near-white (#f7f8fa), not literal #fff — rule 4 above
+ * (cheap Android panels wash out in direct sunlight) is a real field
+ * constraint from a genuinely different problem than the brief's aesthetic
+ * ask, so it's kept: cards (--sk-surface) sit on it at true white for the
+ * "pure white" look while the page canvas itself stays glare-safe.
+ * --sk-danger/--sk-warn/--sk-ok are UNCHANGED on purpose — rule 3 above ties
+ * them to safety semantics (never brand colour), so they stay red/amber/
+ * green regardless of the brand accent swap.
+ */
+:root {
+  --sk-bg: #f7f8fa;
+  --sk-surface: #ffffff;
+  --sk-ink: #0a192f;
+  --sk-ink-soft: #475569;
+
+  --sk-primary: #ff5500;
+  --sk-primary-dark: #e04b00;
+  --sk-primary-soft: #fff2eb;
+
+  /* 2026-09-04: shades refined (still red/amber/green - a brand-colour
+     swap, not a semantic one, per rule 3 at the top of this file) */
+  --sk-danger: #d32f2f;
+  --sk-danger-soft: #fee2e2;
+  --sk-warn: #f57c00;
+  --sk-warn-soft: #fef3c7;
+  --sk-ok: #2e7d32;
+  --sk-ok-soft: #dcfce7;
+
+  --sk-line: #e2e8f0;
+  --sk-radius: 20px;
+  --sk-shadow: 0 2px 8px rgba(10, 25, 47, 0.06), 0 12px 32px rgba(10, 25, 47, 0.06);
+}
+
+/* Kannada/Devanagari first in the stack so Indic glyphs never fall back to a
+   box on Windows or older Android. */
+.shell {
+  font-family: "Noto Sans Kannada", "Noto Sans Devanagari", "Nirmala UI", "Tunga",
+    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  min-height: 100dvh;
+  background: var(--sk-bg);
+  color: var(--sk-ink);
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 0;
+}
+
+.shell[data-logs="closed"] {
+  grid-template-columns: 56px 1fr;
+}
+
+/* ---------- Log rail (left) ---------------------------------------------- */
+
+.logRail {
+  border-right: 1px solid var(--sk-line);
+  background: #f7f4ef;
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  position: sticky;
+  top: 0;
+  max-height: 100dvh;
+}
+
+.logHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px;
+  border-bottom: 1px solid var(--sk-line);
+}
+
+.logTitle {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--sk-ink-soft);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.logToggle,
+.logCopy {
+  border: 1px solid var(--sk-line);
+  background: var(--sk-surface);
+  color: var(--sk-ink-soft);
+  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.logToggle:hover,
+.logCopy:hover {
+  background: #efe9e1;
+}
+
+.logBody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.logRow {
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: var(--sk-ink-soft);
+  word-break: break-word;
+  border-left: 3px solid transparent;
+}
+
+.logRow time {
+  color: #9aa4b2;
+  margin-right: 6px;
+}
+
+.logRow[data-kind="warn"] {
+  border-left-color: var(--sk-warn);
+  background: #fffaf0;
+  color: #7c4a03;
+}
+.logRow[data-kind="error"] {
+  border-left-color: var(--sk-danger);
+  background: var(--sk-danger-soft);
+  color: #7f1d1d;
+}
+.logRow[data-kind="ok"] {
+  border-left-color: var(--sk-ok);
+}
+
+.logEmpty {
+  padding: 16px 10px;
+  color: #9aa4b2;
+  font-size: 11px;
+}
+
+/* pipeline_event()'s full `details` payload - see agent.py. Every field the
+   worker actually attached (which provider, how long, what value got
+   recorded), not just the human summary line above it. */
+.logDetails {
+  margin-top: 2px;
+  padding-left: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.logDetailPair {
+  white-space: nowrap;
+  word-break: break-word;
+}
+
+.logDetailKey {
+  color: #6b7684;
+}
+
+/* The `error`/`traceback` fields specifically - "where the breakage is".
+   Full width, wrapping, own scroll if a traceback runs long, so a real
+   stack trace is never truncated the way the summary line above it is. */
+.logFailure {
+  margin: 4px 0 0 14px;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--sk-danger);
+  border-radius: 4px;
+  color: #7f1d1d;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* Collapsed rail: just a vertical label, so the logs never steal attention. */
+.railClosed {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  padding: 16px 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #9aa4b2;
+  text-align: center;
+}
+
+/* ---------- Main stage ---------------------------------------------------- */
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px 20px 32px;
+  gap: 18px;
+}
+
+/* Live-call rendering (SakhiLiveSession.tsx, 2026-08-30) owns its own exact
+ * 100dvh box and internal padding - unlike .stage above, no padding/gap/
+ * centering here, or the live session's own h-full would be measured
+ * against a shrunk box and its 4 fixed-percentage sections would no longer
+ * add up to one full, non-scrolling screen. */
+.stageLive {
+  display: flex;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.header {
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.brandMark {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: var(--sk-primary);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  flex: none;
+}
+
+.brandText {
+  /* min-width was 0 (the usual "let a flex item shrink below its content"
+     escape hatch) - fine while .header held only two other rigid-content
+     siblings, but once the low-power toggle and the connection pill were
+     added (2026-08-30) it let the flexbox solver crush this down to ~28px
+     on a narrow phone instead of wrapping those siblings onto their own
+     line (.header already has flex-wrap: wrap for exactly that), turning
+     "Sakhi · AI Clinical Co-Pilot" into one word per line. A real min-width
+     forces the wrap to happen on the OTHER items instead. */
+  flex: 1 1 200px;
+  min-width: 200px;
+}
+
+.brandName {
+  font-size: 26px;
+  font-weight: 800;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.brandSub {
+  font-size: 14px;
+  color: var(--sk-ink-soft);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.linkPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--sk-line);
+  background: var(--sk-surface);
+  color: var(--sk-ink-soft);
+  white-space: nowrap;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #cbd2d9;
+  flex: none;
+}
+.dot[data-live="true"] {
+  background: var(--sk-ok);
+  box-shadow: 0 0 0 4px var(--sk-ok-soft);
+}
+
+/* ---------- Avatar ------------------------------------------------------- */
+
+.avatarCard {
+  width: 100%;
+  max-width: 720px;
+  /* The four clips (idle/namaskara/talk1/talk2) are 640x640 — a square
+     source. This used to be 4/3: with object-fit: cover, a wider-than-tall
+     box crops a square video top+bottom, centered by default. Her face sits
+     in the upper part of the frame with headroom above it, so that crop cut
+     straight through the forehead/hair - "the woman's full face is not
+     there in the screen". Matching the container to the source's actual 1:1
+     ratio makes object-fit: cover a pure scale, no crop at all. */
+  aspect-ratio: 1 / 1;
+  background: linear-gradient(160deg, #f7f8fa 0%, #ffffff 100%);
+  border-radius: 28px;
+  border: 1px solid var(--sk-line);
+  box-shadow: var(--sk-shadow);
+  overflow: hidden;
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+/* Applied only to SakhiVideoAvatar's own card (via an extra className,
+   never on the idle-placeholder/connecting-spinner instances of
+   .avatarCard, which keep the pale mint-to-cream look). Sampled from the
+   corners of the actual video clips (a muted sage/olive backdrop,
+   ~rgb(125,122,98) to rgb(154,151,125)), not an arbitrary brand colour.
+   Defense-in-depth for the crossfade white-flash fix: the real fix is
+   waiting for a confirmed-painted frame before revealing a clip (see
+   SakhiVideoAvatar's crossfadeTo comment), but on a browser without
+   requestVideoFrameCallback (the double-rAF fallback path) any residual gap
+   now shows this near-match tone instead of the old near-white gradient - a
+   soft flicker instead of a stark white flash. */
+.avatarCardVideo {
+  background: linear-gradient(160deg, #8a876e 0%, #9c987e 100%);
+}
+
+.avatarCard video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* Two stacked layers for SakhiVideoAvatar's crossfade. object-fit/size
+   inherited from `.avatarCard video` above; this only adds the absolute
+   stacking and the opacity transition. Opacity-only so the browser can
+   composite the crossfade on the GPU without a layout or paint pass on
+   anything else in the card. */
+.avatarVideoLayer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: opacity 220ms ease-in-out;
+  /* Explicit, not relying on the browser's own initial value: both layers
+     start visible until SakhiVideoAvatar's mount effect imperatively hides
+     slot B. Opacity is never set via a React style prop after that - see
+     the long comment in SakhiVideoAvatar.tsx for why a React-controlled
+     style prop here would actively fight the crossfade logic. */
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatarVideoLayer {
+    transition: none;
+  }
+}
+
+/* Connecting shimmer — reassurance that something is happening on a slow link */
+.spinner {
+  width: 46px;
+  height: 46px;
+  border: 5px solid var(--sk-primary-soft);
+  border-top-color: var(--sk-primary);
+  border-radius: 50%;
+  margin: 0 auto 14px;
+  animation: spin 900ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- Responsive ---------------------------------------------------- */
+
+/* On a phone the log rail stops being a column and becomes a collapsed strip
+   at the bottom, so the call owns the whole screen. */
+@media (max-width: 860px) {
+  .shell,
+  .shell[data-logs="closed"] {
+    grid-template-columns: 1fr;
+  }
+
+  .logRail {
+    order: 2;
+    position: static;
+    min-height: 0;
+    max-height: 34dvh;
+    border-right: none;
+    border-top: 1px solid var(--sk-line);
+  }
+
+  .railClosed {
+    writing-mode: horizontal-tb;
+    transform: none;
+    padding: 10px;
+  }
+
+  .stage { order: 1; padding: 16px 14px 24px; }
+  .brandName { font-size: 23px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+/* ----------------------------------------------------------------------
+ * Low-power mode toggle.
+ *
+ * A heuristic (narrow viewport / mobile UA) picks a default, but the
+ * override is what actually matters: a tablet on wifi doesn't need
+ * power-saving, and an old Android phone on 3G does regardless of screen
+ * size - see AvatarStage's usage in page.tsx.
+ * ---------------------------------------------------------------------- */
+.lowPowerToggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: var(--sk-surface, #fff);
+  cursor: pointer;
+}
+
+.lowPowerToggle input {
+  accent-color: var(--sk-accent, var(--sk-primary));
+}

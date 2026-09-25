@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment secrets - NEVER commit
+.env
+.env.local
+.env.*.local
+frontend/.env.local
+
+# AWS deploy generated state - NEVER commit. Confirmed live 2026-09-10:
+# deploy/aws/.deploy-state/egress-access-key.json holds a REAL, active IAM
+# access key + secret (created by provision_infra.sh/push_secrets.sh), with
+# an EC2 instance id and account-id-bearing IAM policy JSON alongside it -
+# generated deployment output, not source, and one of these files is a live
+# credential that must never reach git history.
+deploy/aws/.deploy-state/
+
+# Database - local SQLite is test/mock data only; production is Supabase.
+data/
+tests/data/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Auto-generated per-voice greeting cache - regenerated on first use,
+# hash-keyed to GREETING_TEXT so it never goes stale. Not source.
+assets/audio/greetings/
+# Same for the per-clause TTS cache (tts_audio_cache.CachedTTS).
+assets/audio/tts_cache/
+
+# Logs
+*.log
+logs/
+
+# Node.js
+node_modules/
+frontend/.next/
+frontend/out/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# pytest cache
+.pytest_cache/
