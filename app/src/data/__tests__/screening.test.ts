@@ -4,7 +4,7 @@ import { kv } from '@/lib/kv';
 
 import { ME_ASHA } from '../care-network';
 import { clinicalFacts, groupsFor, parseBp, testsFor, validField } from '../clinical';
-import { evaluate, isHighRisk, QUESTION_BANK, questionCount, questionsFor, triggersOf, VISIT_QUESTIONS, visitFor, type AnswerRecord, type Sign } from '../mockScreening';
+import { evaluate, isHighRisk, QUESTION_BANK, questionCount, questionsFor, triggersOf, VISIT_QUESTIONS, VISIT_SECTIONS, visitFor, type AnswerRecord, type Sign } from '../mockScreening';
 import { careStatus, riskOf, sortByRisk, store } from '../store';
 
 // Regression cases for the deterministic screening rules (the doctor's
@@ -21,10 +21,10 @@ const get = (id: string) => store.get().find((m) => m.id === id)!;
 beforeEach(() => store.resetDemo());
 
 describe('the questionnaires', () => {
-  it('first visit asks 21 questions; second 9; third 11 (each ends with the closing line)', () => {
+  it('first visit asks 21 questions; second 7; third 8 (as in the ANC framework tables; each ends with the closing line)', () => {
     expect(questionCount(1)).toBe(21);
-    expect(questionCount(2)).toBe(9);
-    expect(questionCount(3)).toBe(11);
+    expect(questionCount(2)).toBe(7);
+    expect(questionCount(3)).toBe(8);
     for (const v of [1, 2, 3] as const) expect(VISIT_QUESTIONS[v][VISIT_QUESTIONS[v].length - 1]).toBe('close');
   });
 
@@ -95,6 +95,21 @@ describe('clinical entry (what the ASHA enters)', () => {
     expect(parseBp('148')).toBeNull();
     expect(validField({ kind: 'number', unit: 'kg', min: 25, max: 150, decimals: true }, '61.5')).toBe(true);
     expect(validField({ kind: 'number', unit: 'kg', min: 25, max: 150 }, '400')).toBe(false);
+  });
+
+  it('the check-in screen shows exactly the questions Sakhi asks, in asking order, under the framework sections', () => {
+    for (const v of [1, 2, 3] as const) {
+      const shown = VISIT_SECTIONS[v].flatMap((sec) => sec.ids);
+      expect([v, shown]).toEqual([v, VISIT_QUESTIONS[v].filter((id) => id !== 'close')]);
+    }
+    expect(VISIT_SECTIONS[1].map((sec) => sec.title)).toEqual(['secPersonal', 'secHistory', 'secConditions', 'secCurrent']);
+  });
+
+  it('the ASHA entries cover the framework: visit details, medicines and vaccines, risk assessment, follow-up', () => {
+    const ids = (v: 1 | 2 | 3) => groupsFor(v).flatMap((g) => g.fields.map((f) => f.id));
+    expect(ids(2)).toEqual(expect.arrayContaining(['visitDate', 'gaWeeks', 'ifaGiven', 'calciumGiven', 'tdDose', 'referral', 'doctorAdvice', 'nextAnc']));
+    expect(ids(3)).toEqual(expect.arrayContaining(['visitDate', 'gaWeeks', 'riskFactors', 'newConcerns', 'facility', 'transport', 'supportPerson', 'referral', 'nextAnc']));
+    expect(ids(1)).toEqual(expect.arrayContaining(['regDate', 'phone', 'ifaGiven', 'tdDose', 'referral']));
   });
 
   it('the fields follow the MCP card per visit', () => {

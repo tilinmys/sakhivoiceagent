@@ -15,6 +15,7 @@ const wavBody = new Uint8Array([82, 73, 70, 70]);
 function load(env: Record<string, string> = {}) {
   process.env.EXPO_PUBLIC_SAKHI_GATEWAY = 'https://gw.test/api/sakhi';
   delete process.env.EXPO_PUBLIC_SAKHI_GATEWAY_TOKEN;
+  delete process.env.EXPO_PUBLIC_SAKHI_GATEWAY_LAN;
   Object.assign(process.env, env);
   let mod!: typeof import('../gateway');
   jest.isolateModules(() => {
@@ -29,6 +30,43 @@ beforeEach(() => {
 });
 
 describe('gateway', () => {
+  it('a phone on the same Wi-Fi as the PC: both routes are raced, the faster carries STT; a dead LAN falls back to the tunnel', async () => {
+    const { gateway } = load({ EXPO_PUBLIC_SAKHI_GATEWAY_LAN: 'http://192.168.0.12:8787/api/sakhi' });
+    const later = (ms: number, body: unknown) => new Promise<Awaited<ReturnType<Fetch>>>((r) => setTimeout(() => r({ ok: true, status: 200, json: async () => body, arrayBuffer: async () => new ArrayBuffer(0) }), ms));
+    mockFetch.mockImplementation((url) => (url.startsWith('http://192.168') ? later(5, { stt: true, tts: true }) : later(60, { stt: true, tts: true })));
+    await expect(gateway.health()).resolves.toEqual({ stt: true, tts: true });
+    expect(gateway.route).toBe('http://192.168.0.12:8787/api/sakhi');
+    mockFetch.mockReset();
+    mockFetch.mockImplementation((url) => (url.startsWith('http://192.168') ? Promise.reject(new Error('Network request failed')) : ok({ text: 'ok', en: '', ms: 200 })));
+    await expect(gateway.stt(wavBody, 'kn')).rejects.toMatchObject({ retryable: true });
+    expect(gateway.route).toBe('https://gw.test/api/sakhi');
+    await expect(gateway.stt(wavBody, 'kn')).resolves.toMatchObject({ text: 'ok' }); // the retry goes over the tunnel
+    expect(gateway.offline).toBe(false);
+  });
+
+  it('the LAN route is not reachable: the tunnel wins the race', async () => {
+    const { gateway } = load({ EXPO_PUBLIC_SAKHI_GATEWAY_LAN: 'http://192.168.0.12:8787/api/sakhi' });
+    mockFetch.mockImplementation((url) => (url.startsWith('http://192.168') ? Promise.reject(new Error('timeout')) : ok({ stt: true, tts: true })));
+    await expect(gateway.health()).resolves.toEqual({ stt: true, tts: true });
+    expect(gateway.route).toBe('https://gw.test/api/sakhi');
+  });
+
+  it('warm(): one tiny request on an idle connection, none while it is in use', async () => {
+    const { gateway } = load();
+    mockFetch.mockReturnValue(ok({ stt: true, tts: true }));
+    await gateway.health();
+    mockFetch.mockClear();
+    gateway.warm(); // just used by health(): still warm
+    expect(mockFetch).not.toHaveBeenCalled();
+    const now = Date.now();
+    const spy = jest.spyOn(Date, 'now').mockReturnValue(now + 11_000);
+    gateway.warm();
+    gateway.warm();
+    spy.mockRestore();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch.mock.calls[0][0]).toBe('https://gw.test/api/sakhi/health');
+  });
+
   it('health: ok, HTTP errors and a dead network all give a definite answer', async () => {
     const { gateway } = load();
     mockFetch.mockReturnValueOnce(ok({ stt: true, tts: true, provider: 'gnani' }));

@@ -9,7 +9,8 @@ import { format, STRINGS, type Lang, type StringKey } from '@/i18n/strings';
 
 import { answerBody, deleteAnswer, saveAnswer } from './answer-files';
 import { voiceDb } from './db';
-import { gateway, GatewayError } from './gateway';
+import type { AnswerStatus } from './db-types';
+import { gateway, GatewayError, type SttResult } from './gateway';
 import type { RemoteVoice } from './live';
 import { short, vlog, vlogReset } from './log';
 import { claimSession, releaseSession } from './outbox-worker';
@@ -20,7 +21,8 @@ import { AFTER_STOP_MS, Mic, micPermission, micSupported, playbackMode, unlockAu
 import { Speaker, type VoiceSource } from './speaker';
 import { decide, freshState, type Heard } from './turn-policy';
 import { Utterance } from './utterance';
-import { Endpointer, FRAME_SAMPLES, frameDb } from './vad';
+import { SttStream } from './stream';
+import { Endpointer, FRAME_SAMPLES, frameDb, VoicingMeter } from './vad';
 
 // The Sakhi conversation engine (docs/VOICE_IN_APP_DESIGN.md). One object
 // per check-in, OUTSIDE React: audio frames, timers and network never touch
@@ -97,6 +99,39 @@ const WAIT_LISTEN_MS = 20_000;
 const BACKGROUND_PAUSE_MS = 800;
 /** Questions in a row with no voice at all: then Sakhi stops asking and waits for a tap. */
 const AWAY_AFTER = 2;
+/**
+ * After an answer is understood AND written to the phone's database, the
+ * ASHA sees it ("Saved: 24 years") with a Next button for this long; then
+ * Sakhi moves on by herself. Next skips the rest of the wait. The short
+ * spoken "noted" (~0.6 s, prerecorded) plays inside this window: the
+ * window is that line, so the card costs no time of its own.
+ */
+const CONFIRM_MS = 650;
+/** Next stays on screen at least this long after the "noted" line ends (never 0 ms flashes). */
+const NEXT_MIN_MS = 0;
+/**
+ * Android: the mic stream stays OPEN for the whole check-in. Field log
+ * 2026-11-13: every turn paid "mic on 672-738 ms" (stream restart + record
+ * mode) and "mode playback 135 ms" (switch back) = ~0.85 s of dead air after
+ * each question, in which her first syllable could be lost. Half-duplex is
+ * kept in software: frames are only used while Sakhi listens, and not before
+ * ECHO_TAIL_MS after her line ended (the loudspeaker's ring-down). iOS keeps
+ * the hardware half-duplex: its record category mutes playback (mic.ts).
+ */
+const KEEP_MIC_DEFAULT = Platform.OS === 'android';
+const ECHO_TAIL_MS = 150;
+/** Voiced 20 ms frames before a pause may ask for an early transcript (300 ms: not a first syllable). */
+const MIN_VOICED_FOR_EARLY = 15;
+/**
+ * Number / date answers ("ಇಪ್ಪತ್ತು ... ನಾಲ್ಕು", "twenty ... four"): the first
+ * half is already a complete number, so an early end needs this much silence
+ * after her last word (the second digit comes within it). Other plain
+ * answers end as soon as their transcript is back.
+ */
+const NUMBER_HOLD_MS = 650;
+const NUMBER_QUESTIONS = new Set(['age', 'prevPregnancies', 'deliveries', 'lmp']);
+/** The answers table write is retried this often (in the background) before it is given up. */
+const SAVE_RETRIES = [300, 1500];
 
 export type Stage = 'idle' | 'preparing' | 'asking' | 'listening' | 'hearing' | 'finishing' | 'done' | 'exited';
 
@@ -116,6 +151,26 @@ const MOVES: Record<Stage, readonly Stage[]> = {
   exited: [],
 };
 export type Line = { key: string; idx?: number; from: 'sakhi' | 'asha'; text: string; sub?: string; danger?: boolean; pending?: boolean; offline?: boolean };
+/**
+ * What a question's answer was saved as, for the ASHA to see at a glance:
+ * her words (heard), what went into the record (value), and whether the
+ * row is written to the phone's database (persisted).
+ */
+export type Saved = {
+  idx: number;
+  qid: string;
+  question: string;
+  heard: string | null;
+  value: string;
+  danger: boolean;
+  status: AnswerStatus;
+  /** End of her speech -> saved (ms); null with no speech. */
+  latencyMs: number | null;
+  /** The row is in the phone's answers table (written in the background, right after it is shown). */
+  persisted: boolean;
+  /** The background write failed after its retries: the card says so. */
+  writeFailed?: boolean;
+};
 export type Alert = { idx: number; qid: string; code: RuleCode; text: string; prev?: AnswerRecord };
 /** A sign that stopped the questionnaire, waiting for the ASHA to act. */
 export type Urgent = { idx: number; qid: string; code: RuleCode; signs: Sign[]; text: string };
@@ -150,6 +205,14 @@ export type Snapshot = {
    * it ("say it again" / "one minute": command).
    */
   reason: AskReason | null;
+  /** The answer saved last (the confirmation card), null before the first. */
+  saved: Saved | null;
+  /** Every saved answer so far, in question order (one per question). */
+  answers: Saved[];
+  /** An answer was just saved: the ASHA may tap Next (or Sakhi moves on by herself). */
+  confirming: boolean;
+  /** A line of Sakhi's is playing now (the Next button waits for it to finish). */
+  isPromptPlaying: boolean;
 };
 
 export type AskReason = 'followUp' | 'reask' | 'nudge' | 'command';
@@ -175,6 +238,16 @@ function hangoverFor(qid: string, dangerTrigger: boolean) {
   return dangerTrigger ? 850 : 550;
 }
 
+/**
+ * The longest one answer may run before the turn is cut. Field logs showed
+ * answers running to the old 20 s cap (talk / noise that never paused): a
+ * 20 s noisy clip took the recogniser 10-27 s and timed out. A real answer
+ * fits easily: 10 s for numbers, dates and yes / no, 15 s for descriptions.
+ */
+function maxSpeechFor(qid: string) {
+  return qid === 'concerns' || qid === 'newProblems' || qid === 'pastProblems' || qid === 'conditions' || qid === 'medicines' ? 15_000 : 10_000;
+}
+
 /** The most severe rule among these signs (EC-01 before HM-01 before the rest). */
 const SEVERITY: RuleCode[] = ['EC-01', 'PE-04', 'PE-02', 'HM-01', 'PE-01', 'PE-03', 'FM-01', 'IN-01', 'AN-01'];
 const worst = (codes: RuleCode[]) => [...codes].sort((a, b) => SEVERITY.indexOf(a) - SEVERITY.indexOf(b))[0];
@@ -191,8 +264,40 @@ export class SakhiEngine {
   private prepared: Promise<'live' | 'demo'> | null = null;
   private mic: Mic | null = null;
   private vad = new Endpointer();
+  private meter = new VoicingMeter();
   private utt = new Utterance();
-  private listening: { resolve: (r: ListenResult) => void } | null = null;
+  private listening: { resolve: (r: ListenResult) => void; i: number; my: number } | null = null;
+  /** The speech service answered health (speculative transcription only then). */
+  private sttUp = false;
+  /** Streaming STT for this check-in (voice/stream.ts): her frames live, ~190 ms to text. */
+  private stream: SttStream | null = null;
+  /** The mic stream stays open between turns (Android; see KEEP_MIC_DEFAULT). */
+  private get keepMic() {
+    return this.opts.keepMic ?? KEEP_MIC_DEFAULT;
+  }
+  /** Android, mic kept open: frames before this instant are Sakhi's own echo (dropped). */
+  private hearFrom = 0;
+  /** The intro's mic test, while it runs (Start ends it: it must not hold the audio session). */
+  private testing: Mic | null = null;
+  /**
+   * Speculative transcription, per question: what she said up to a 200 ms
+   * pause, already sent while the endpointer still waits out its hangover.
+   * `voiced`: her voiced frames at that moment; the turn's audio is the same
+   * answer only if she said nothing more (the count did not grow).
+   */
+  private spec = new Map<number, { voiced: number; result: Promise<SttResult | null>; quietAt: number }>();
+  /** Her voiced frames when each turn ended (to match a speculative result). */
+  private voicedAtEnd = new Map<number, number>();
+  /** A number answer that is complete but still inside its NUMBER_HOLD_MS (ends on a later frame). */
+  private heldEnd: { i: number; my: number; voiced: number; quietAt: number } | null = null;
+  /** Answers table writes still in flight (background, retried). */
+  private writes = new Set<Promise<void>>();
+  /**
+   * Turn telemetry (ms epoch): t0 prompt finished, t1 first mic frame, t2 her
+   * speech ended, t3 answer understood, t4 save queued; t5 (the next
+   * prompt's audio start) closes the turn and the deltas are persisted.
+   */
+  private tl: { i: number; t0: number; t1?: number; t2?: number; t3?: number; t4?: number } | null = null;
   /** Ends the current listen now (Next button), live or demo. */
   private forceEnd: (() => void) | null = null;
   private speaker: Speaker | null = null;
@@ -228,11 +333,18 @@ export class SakhiEngine {
   private heard = new Map<number, (o: Understood) => void>();
   /** The slot the last follow-up of a question asked for (its bare reply goes there). */
   private expecting = new Map<number, Expect>();
+  /** Urgent signs already queued to stop the questionnaire (each stops it once). */
+  private urgentRaised = new Set<Sign>();
   /** Questions whose danger was already announced (a re-ask never repeats it). */
   private noticed = new Set<number>();
   private closingSaid = false;
   /** Questions in a row that ended with no voice at all (see AWAY_AFTER). */
   private silentRun = 0;
+  /** Per question: the record last written, and when her speech ended (for the latency). */
+  private recs = new Map<number, AnswerRecord>();
+  private endedAt = new Map<number, number>();
+  /** Ends the confirmation window now (the ASHA tapped Next). */
+  private confirmEnd: (() => void) | null = null;
 
   constructor(
     private readonly mother: MotherRecord,
@@ -242,13 +354,13 @@ export class SakhiEngine {
      * warm: false when another voice brings the audio (Sakhi Direct): no HTTP
      * warm-up competing with it. visit: the questionnaire (default: hers, visitFor).
      */
-    private readonly opts: { warm?: boolean; visit?: Visit } = {},
+    private readonly opts: { warm?: boolean; visit?: Visit; confirmMs?: number; keepMic?: boolean } = {},
   ) {
     this.sessionId = `${mother.id}-${Date.now().toString(36)}`;
     this.visit = opts.visit ?? visitFor(mother);
     this.questions = questionsFor(this.visit);
     this.intake = new Intake(this.visit, gestationWeeks(mother));
-    this.snap = { stage: 'idle', idx: 0, answered: 0, lines: [], alerts: [], level: 0, mode: 'demo', offline: false, pending: 0, gapMs: null, micDenied: false, voice: null, transport: 'phone', liveLost: false, held: false, urgent: null, processing: false, reason: null };
+    this.snap = { stage: 'idle', idx: 0, answered: 0, lines: [], alerts: [], level: 0, mode: 'demo', offline: false, pending: 0, gapMs: null, micDenied: false, voice: null, transport: 'phone', liveLost: false, held: false, urgent: null, processing: false, reason: null, saved: null, answers: [], confirming: false, isPromptPlaying: false };
   }
 
   // ---- React bridge --------------------------------------------------------
@@ -329,6 +441,11 @@ export class SakhiEngine {
       // the answers are still recorded on the phone and transcribed when it
       // is back (the outbox); demo answers are ONLY for a device with no mic.
       const mode: 'live' | 'demo' = granted ? 'live' : 'demo';
+      this.sttUp = health.stt;
+      if (granted && health.stt && !this.stream) {
+        this.stream = new SttStream(this.lang);
+        this.stream.start();
+      }
       if (granted && !health.stt) vlog('err', 'speech service not reachable: answers are recorded and transcribed when it is back');
       if (this.released) return mode; // released meanwhile: no speaker, no downloads
       vlog('run', `mode ${mode.toUpperCase()}; Sakhi's voice: ${serverVoice ? 'server (Gnani)' : 'the phone'}`);
@@ -385,8 +502,9 @@ export class SakhiEngine {
       if (ok || my !== this.token) return;
       // Not said by the agent (it went away): say it here instead.
     }
-    if (this.mic?.on) this.mic.stop();
-    if (this.needPlayback) {
+    const keep = this.keepMic && !!this.mic?.on;
+    if (this.mic?.on && !keep) this.mic.stop();
+    if (this.needPlayback && !keep) {
       const since = Date.now() - (this.mic?.stoppedAt ?? 0);
       if (since < AFTER_STOP_MS) await this.wait(AFTER_STOP_MS - since);
       await playbackMode().catch((e) => vlog('err', `audio mode: ${String(e)}`));
@@ -394,7 +512,13 @@ export class SakhiEngine {
     }
     // A Repeat / exit while switching: this line is no longer wanted.
     if (my !== this.token) return;
-    await this.speaker?.speak(text, onStart);
+    this.set({ isPromptPlaying: true });
+    try {
+      await this.speaker?.speak(text, onStart);
+    } finally {
+      this.hearFrom = Date.now() + ECHO_TAIL_MS;
+      this.set({ isPromptPlaying: false });
+    }
   }
 
   /**
@@ -423,6 +547,7 @@ export class SakhiEngine {
         this.emitLevel(level);
       }
     });
+    this.testing = mic;
     try {
       await mic.start();
       await new Promise((r) => setTimeout(r, ms));
@@ -430,6 +555,7 @@ export class SakhiEngine {
       vlog('err', `mic test failed: ${String((e as Error)?.message ?? e)}`);
       return { result: 'unavailable', peakDb: peak };
     } finally {
+      if (this.testing === mic) this.testing = null;
       mic.dispose();
       this.emitLevel(0);
       this.needPlayback = true; // iOS: the next line must switch the audio back to playback
@@ -443,6 +569,15 @@ export class SakhiEngine {
     // First, inside the tap: the web only allows sound after a user gesture.
     unlockAudio();
     if (this.snap.stage !== 'idle') return;
+    // Start tapped while the mic test still runs: end it NOW. Field log: the
+    // test's stream stopping 1.5 s into the greeting cut the greeting's
+    // finish event, and the check-in sat silent until Repeat was tapped.
+    if (this.testing) {
+      this.testing.dispose();
+      this.testing = null;
+      this.needPlayback = true;
+      vlog('mic', 'test ended: the check-in starts');
+    }
     this.go('preparing');
     const mode = await this.prepare();
     this.speaker ??= new Speaker(this.lang, false, (v) => this.snap.voice !== v && this.set({ voice: v }));
@@ -527,9 +662,12 @@ export class SakhiEngine {
 
   private halt() {
     this.released = true;
+    this.stream?.close();
+    this.stream = null;
     releaseSession(this.sessionId); // anything still owed goes to the outbox worker
     this.token++;
     this.listening = null;
+    this.confirmEnd = null;
     if (this.remote) {
       this.remote.stop();
       this.remote.onLost(null);
@@ -607,7 +745,10 @@ export class SakhiEngine {
         this.set({ answered: Math.max(this.snap.answered, i + 1) });
         continue;
       }
-      if (i + 1 < total && !this.remote) this.speaker?.prefetch(questionText(this.questions[i + 1], this.lang));
+      if (i + 1 < total && !this.remote) {
+        this.speaker?.prefetch(questionText(this.questions[i + 1], this.lang));
+        this.speaker?.ready?.(questionText(this.questions[i + 1], this.lang));
+      }
       vlog('run', `Q${i + 1}/${total} ${q.id} "${short(text)}"${this.remote ? ' (live)' : ''}`);
       if (!(await this.converse(i, my, text))) return;
     }
@@ -681,23 +822,33 @@ export class SakhiEngine {
       this.expecting.delete(i);
       switch (step.action) {
         case 'next':
-          // Understood: a short "noted" (and a tap on her hand) so the ASHA
-          // knows it was recorded without looking. Not when a danger line or
-          // an urgent stop comes next (that speaks for itself), nor before
-          // the closing line.
+          // Understood: written to the phone's database FIRST, then shown
+          // ("Saved: ..."), with a short spoken "noted" and a tap on her
+          // hand, so the ASHA knows it is recorded without looking. Next is
+          // offered only now; Sakhi moves on by herself after the window.
+          // No "noted" when a danger line or an urgent stop comes next (that
+          // speaks for itself), nor before the closing line.
           if (heard === 'complete') {
+            await this.commit(i, 'saved');
+            if (my !== this.token) return false;
             Haptic.light();
             const last = i + 1 >= this.questions.length || this.intake.isSayOnly(this.questions[i + 1].id);
-            if (!last && !this.notices.length && !this.urgentQueue.length) {
-              const ok = SAKHI_REPLIES[this.lang].ok;
-              await this.speakLine(ok);
-              if (my !== this.token) return false;
-            }
+            await this.confirm(my, !last && !this.notices.length && !this.urgentQueue.length);
+            if (my !== this.token) return false;
+          } else {
+            // Not transcribed in time (offline / slow): her voice is kept and
+            // applied when its words come; the card says so.
+            await this.commit(i, 'offline', { value: this.say('vSavedOffline'), danger: false });
+            if (my !== this.token) return false;
           }
           return true;
         case 'skip':
           // Recorded as skipped for the doctor to see; not a danger SIGN, so no alarm.
-          if (!this.intake.skippable(q.id)) this.record(i, { value: 'Skipped (check)', danger: false });
+          if (!this.intake.skippable(q.id)) {
+            this.record(i, { value: 'Skipped (check)', danger: false });
+            await this.commit(i, 'skipped');
+            if (my !== this.token) return false;
+          }
           return true;
         case 'giveUp': {
           // Nobody has spoken for several questions: she may have stepped
@@ -710,6 +861,8 @@ export class SakhiEngine {
           const rec = this.intake.giveUp(q.id, this.lastHeard.get(i) ?? '');
           this.record(i, rec);
           vlog('run', `Q${i + 1} ${q.id} recorded as it stands: "${short(rec.value, 40)}"`);
+          await this.commit(i, heard === 'silence' ? 'no_answer' : 'unclear');
+          if (my !== this.token) return false;
           return true;
         }
         case 'followUp': {
@@ -717,7 +870,7 @@ export class SakhiEngine {
           const f = this.intake.missing(q.id);
           if (!f) return true;
           prompt = followUpText(this.lang, f);
-          if ('key' in f) this.expecting.set(i, f.expect);
+          if ('key' in f && f.expect) this.expecting.set(i, f.expect);
           this.set({ reason: 'followUp' });
           this.line({ from: 'sakhi', text: prompt, idx: i });
           break;
@@ -792,6 +945,7 @@ export class SakhiEngine {
       if (my !== this.token) return 'pending';
     }
     if (got === null) return 'pending';
+    if (this.tl && this.tl.i === i) this.tl.t3 = Date.now();
     if (typeof got === 'string') return got; // a command: repeat / wait / skip
     if (got.prefilled.length) vlog('run', `prefilled from this answer: ${got.prefilled.join(', ')}`);
     if (got.complete) return 'complete';
@@ -804,8 +958,10 @@ export class SakhiEngine {
     const rec = this.intake.record(q.id);
     vlog('run', `Q${i + 1} ${q.id} skipped: already answered ("${short(rec.value, 40)}")`);
     store.recordAnswer(this.mother.id, q.id, rec);
+    this.recs.set(i, rec);
     this.line({ from: 'asha', idx: i, text: this.say('vFromEarlier', { value: rec.value }), sub: questionText(q, this.lang) });
     this.set({ answered: Math.max(this.snap.answered, i + 1) });
+    this.commit(i, 'prefilled').catch(() => {});
     voiceDb.upsertTurn({ session_id: this.sessionId, idx: i, qid: q.id, question: questionText(q, this.lang), audio_uri: null, transcript: rec.value, stt_status: 'prefilled', ended_speech_at: null }).catch(() => {});
   }
 
@@ -838,6 +994,8 @@ export class SakhiEngine {
     }
     await this.speakLine(text, onStart);
     if (my !== this.token) return { kind: 'skip' };
+    this.tl = { i, t0: Date.now() };
+    this.speaker?.ready?.(SAKHI_REPLIES[this.lang].ok); // loaded while she answers: plays at once
     return this.listen(i, my);
   }
 
@@ -875,14 +1033,19 @@ export class SakhiEngine {
       });
     }
     return new Promise((resolve) => {
-      this.vad.reset({ hangoverMs: hangoverFor(q.id, q.dangerTrigger) });
+      this.vad.reset({ hangoverMs: hangoverFor(q.id, q.dangerTrigger), maxSpeechMs: maxSpeechFor(q.id) });
+      this.meter.reset();
       this.utt.reset();
+      this.spec.delete(i);
+      this.heldEnd = null;
       const began = Date.now();
       this.listening = {
+        i,
+        my,
         resolve: (r) => {
           this.listening = null;
           this.forceEnd = null;
-          mic.stop();
+          if (!this.keepMic) mic.stop();
           const v = this.vad;
           vlog(
             'vad',
@@ -899,13 +1062,15 @@ export class SakhiEngine {
         const l = this.listening;
         if (!l) return;
         if (this.vad.isSpeaking) {
+          this.speculate(l.i, l.my);
           this.utt.end();
+          this.voicedAtEnd.set(l.i, this.vad.voicedFrames);
           l.resolve({ kind: 'speech', endedAt: Date.now() });
         } else {
           l.resolve({ kind: 'skip' });
         }
       };
-      this.needPlayback = true;
+      if (!this.keepMic) this.needPlayback = true;
       this.go('listening', { level: 0 });
       mic.start().catch((e) => {
         vlog('err', `mic failed to start: ${String((e as Error)?.message ?? e)}; answers from now on are demo answers`);
@@ -921,24 +1086,125 @@ export class SakhiEngine {
   private onFrame(pcm: Int16Array, off: number) {
     const l = this.listening;
     if (!l) return;
-    const ev = this.vad.push(frameDb(pcm, off, FRAME_SAMPLES));
+    if (this.keepMic && (this.snap.isPromptPlaying || Date.now() < this.hearFrom)) return; // her echo of Sakhi, never her answer
+    if (this.tl && this.tl.i === l.i && this.tl.t1 === undefined) this.tl.t1 = Date.now();
+    const ev = this.vad.push(frameDb(pcm, off, FRAME_SAMPLES), this.meter.push(pcm, off));
+    // A complete number answer waiting out NUMBER_HOLD_MS: she stayed quiet, end now.
+    const h = this.heldEnd;
+    if (h && h.i === l.i && ev !== 'end' && this.vad.isSpeaking) {
+      if (this.vad.voicedFrames !== h.voiced) this.heldEnd = null; // she went on: the full answer decides
+      else if (this.vad.quietForMs >= NUMBER_HOLD_MS) {
+        this.heldEnd = null;
+        vlog('vad', `Q${l.i + 1}: number complete and ${NUMBER_HOLD_MS} ms quiet, turn ends now`);
+        this.utt.end();
+        this.voicedAtEnd.set(l.i, h.voiced);
+        l.resolve({ kind: 'speech', endedAt: h.quietAt });
+        return;
+      }
+    }
     if (ev === 'start') {
       this.utt.begin();
       this.go('hearing');
+      // The HTTP fallback's connection, warm in case the stream is down.
+      if (!this.stream?.up) gateway.warm();
       vlog('vad', `speech start (peak ${this.vad.peakDb.toFixed(0)} dB, floor ${this.vad.floorDb.toFixed(0)} dB)`);
     }
     this.utt.frame(pcm, off);
+    // Live to the recogniser: the pre-roll + first frames at the start, then every frame of the turn.
+    if (this.stream) {
+      if (ev === 'start') {
+        this.stream.beginTurn();
+        this.stream.send(this.utt.view());
+      } else if (this.vad.isSpeaking || ev === 'end') {
+        this.stream.send(pcm, off, FRAME_SAMPLES);
+      }
+    }
+    // A pause inside her answer: the early transcript (not for a fragment under 300 ms of voice).
+    if (ev === 'pause' && this.vad.voicedFrames >= MIN_VOICED_FOR_EARLY) this.speculate(l.i, l.my);
     const now = Date.now();
     if (now - this.lastLevel >= LEVEL_EMIT_MS) {
       this.lastLevel = now;
       this.emitLevel(this.vad.level);
     }
     if (ev === 'end') {
+      this.speculate(l.i, l.my); // the final text (reused if she said nothing since the pause)
       this.utt.end();
-      l.resolve({ kind: 'speech', endedAt: now });
+      this.voicedAtEnd.set(l.i, this.vad.voicedFrames);
+      l.resolve({ kind: 'speech', endedAt: now - this.vad.quietForMs });
     } else if (ev === 'noSpeech') {
       l.resolve({ kind: 'silence' });
     }
+  }
+
+  /**
+   * She paused (200 ms quiet) inside her answer: send what she said so far
+   * NOW, while the endpointer still waits out its hangover (0.55-1.2 s).
+   *   * she says nothing more: the turn's transcript is this one, already
+   *     back (or nearly) when the hangover ends, so the upload and the
+   *     recognition time disappear from the gap
+   *   * and if it already answers the question completely (an age, a date,
+   *     a yes / no), the turn ends AT ONCE, with no hangover at all. Never
+   *     for a danger question or a description (a "no ... but my head
+   *     aches" must be heard to the end): those only reuse the transcript.
+   *   * she goes on talking: the result is simply not used.
+   * One per pause; the gateway's STT lane serves it ahead of any TTS.
+   */
+  private speculate(i: number, my: number) {
+    if (!this.sttUp || this.remote) return;
+    const voiced = this.vad.voicedFrames;
+    const prev = this.spec.get(i);
+    if (prev && prev.voiced === voiced) return;
+    const quietAt = Date.now() - this.vad.quietForMs;
+    const t = Date.now();
+    let result: Promise<SttResult | null>;
+    if (this.stream?.turnIntact) {
+      // The stream already has her audio: a commit, ~190 ms to the text.
+      const lang = this.lang;
+      // null (the stream could not say): no HTTP upload here. At a pause it only
+      // means no early end; at the end of the turn transcribe() uploads her
+      // recording. (Field log: an HTTP upload per failed pause commit put 4
+      // uploads in one turn, all competing for the provider.)
+      result = this.stream.commit().then((text) => (text === null ? null : { text, en: lang === 'en' ? text : '', ms: Date.now() - t }));
+      vlog('stt', `Q${i + 1}: commit on the stream`);
+    } else {
+      if (gateway.offline) return;
+      result = this.httpStt(i);
+      vlog('stt', `Q${i + 1}: speculative upload over HTTP (stream ${this.stream?.up ? 'gap in this answer' : 'not connected'})`);
+    }
+    this.spec.set(i, { voiced, result, quietAt });
+    result.then((r) => {
+      const l = this.listening;
+      if (!r || my !== this.token || !l || l.i !== i || this.vad.voicedFrames !== voiced || !this.vad.isSpeaking) return;
+      vlog('stt', `Q${i + 1}: speculative transcript in ${Date.now() - t} ms "${short(r.text, 50)}"`);
+      if (this.answersAtOnce(i, r.text)) {
+        if (NUMBER_QUESTIONS.has(this.questions[i].id) && this.vad.quietForMs < NUMBER_HOLD_MS) {
+          this.heldEnd = { i, my, voiced, quietAt };
+          return; // ends on the frame that completes NUMBER_HOLD_MS of quiet (onFrame)
+        }
+        vlog('vad', `Q${i + 1}: answer complete, turn ends now (${Date.now() - quietAt} ms after her last word)`);
+        this.utt.end();
+        this.voicedAtEnd.set(i, voiced);
+        l.resolve({ kind: 'speech', endedAt: quietAt });
+      }
+    });
+  }
+
+  /** Her answer so far, over HTTP (the stream's fallback). Never throws. */
+  private httpStt(i: number): Promise<SttResult | null> {
+    const body = this.utt.toUpload();
+    vlog('stt', `Q${i + 1}: HTTP upload (${Math.round(body.length / 1024)} KB)`);
+    return gateway.stt(body, this.lang, 6000).then(
+      (r) => r,
+      () => null,
+    );
+  }
+
+  /** May the turn end on this transcript without waiting out the hangover? */
+  private answersAtOnce(i: number, text: string) {
+    const q = this.questions[i];
+    if (!text.trim() || q.dangerTrigger || q.id === 'concerns' || q.id === 'newProblems') return false;
+    if (commandIn(text)) return true;
+    return this.intake.wouldComplete(q.id, text, this.expecting.get(i));
   }
 
   private demoAnswer(i: number): ListenResult {
@@ -962,12 +1228,14 @@ export class SakhiEngine {
     if (res.kind === 'text') {
       // Live: the agent already transcribed it. Straight to the rules.
       this.gapFrom = res.endedAt;
+      this.endedAt.set(i, res.endedAt);
       Haptic.light();
       this.line({ from: 'asha', idx: i, text: res.text });
       voiceDb.upsertTurn({ session_id: this.sessionId, idx: i, qid: q.id, question, audio_uri: null, transcript: res.text, stt_status: 'done', ended_speech_at: res.endedAt }).catch(() => {});
       return this.apply(i, res.text, '');
     }
     if (res.kind === 'demo') {
+      this.endedAt.set(i, Date.now());
       this.line({ from: 'asha', idx: i, text: res.value });
       voiceDb.upsertTurn({ session_id: this.sessionId, idx: i, qid: q.id, question, audio_uri: null, transcript: res.value, transcript_en: res.value, danger: res.danger ? 1 : 0, stt_status: 'demo', ended_speech_at: Date.now() }).catch(() => {});
       this.apply(i, res.value, res.value, res.danger, res.signs);
@@ -976,10 +1244,12 @@ export class SakhiEngine {
       return null;
     }
     // Live: the WAV goes to disk (and the outbox), the next question starts now.
-    const { uri, ready } = saveAnswer(this.sessionId, i, this.utt.toWav());
+    const { uri, ready } = saveAnswer(this.sessionId, i, this.utt.toUpload());
     this.audio.set(i, uri);
     this.written.set(i, ready);
     this.gapFrom = res.endedAt;
+    this.endedAt.set(i, res.endedAt);
+    if (this.tl && this.tl.i === i) this.tl.t2 = res.endedAt;
     Haptic.light();
     this.line({ from: 'asha', idx: i, text: this.say('vUnderstanding'), pending: true });
     voiceDb.upsertTurn({ session_id: this.sessionId, idx: i, qid: q.id, question, audio_uri: uri, stt_status: 'pending', ended_speech_at: res.endedAt }).catch(() => {});
@@ -987,13 +1257,117 @@ export class SakhiEngine {
     return null;
   }
 
+  /**
+   * Write what question `i` was saved as to the phone's database (answers
+   * table), then show it. The write is awaited (bounded) so the "Saved" tick
+   * means it IS on the phone; a write that fails or is slow still shows the
+   * answer, marked not persisted, and never stalls the conversation.
+   */
+  private async commit(i: number, status: AnswerStatus, override?: AnswerRecord) {
+    const q = this.questions[i];
+    const rec = override ?? this.recs.get(i) ?? this.intake.record(q.id, this.lastHeard.get(i) ?? '');
+    const heard = status === 'prefilled' || status === 'no_answer' || status === 'offline' ? null : (this.lastHeard.get(i) ?? null);
+    const ended = this.endedAt.get(i);
+    const latencyMs = heard !== null && ended !== undefined ? Date.now() - ended : null;
+    // Optimistic: the answer is in memory and on screen NOW; the database
+    // write runs behind (retried), so the next prompt never waits on disk.
+    // The card's tick (persisted) turns on when the row is really written.
+    if (this.released) return;
+    const saved: Saved = { idx: i, qid: q.id, question: questionText(q, this.lang), heard, value: rec.value, danger: !!rec.danger, status, latencyMs, persisted: false };
+    const answers = [...this.snap.answers.filter((a) => a.qid !== q.id), saved].sort((a, b) => a.idx - b.idx);
+    this.set({ saved, answers });
+    if (this.tl && this.tl.i === i) this.tl.t4 = Date.now();
+    vlog('run', `Q${i + 1} ${q.id} SAVED [${status}] "${short(rec.value, 40)}"${latencyMs !== null ? ` ${latencyMs} ms after her speech ended` : ''} (database write queued)`);
+    if (latencyMs !== null) voiceDb.logEvent(this.sessionId, 'answer_saved', latencyMs).catch(() => {});
+    const row = { session_id: this.sessionId, qid: q.id, idx: i, value: rec.value, heard, danger: rec.danger ? 1 : 0, status, latency_ms: latencyMs };
+    const job = (async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await voiceDb.saveAnswer(row);
+          break;
+        } catch (e) {
+          vlog('err', `Q${i + 1}: answer not written to the database (try ${attempt + 1}): ${String((e as Error)?.message ?? e)}`);
+          if (attempt >= SAVE_RETRIES.length) {
+            if (this.released) return;
+            const fail = (a: Saved) => (a === saved ? { ...a, writeFailed: true } : a);
+            this.set({ answers: this.snap.answers.map(fail), saved: this.snap.saved === saved ? fail(saved) : this.snap.saved });
+            return;
+          }
+          await new Promise((r) => setTimeout(r, SAVE_RETRIES[attempt]));
+        }
+      }
+      if (this.released) return;
+      // Mark THIS answer persisted (a newer save of the same question replaces it, untouched).
+      const mark = (a: Saved) => (a === saved ? { ...a, persisted: true } : a);
+      this.set({ answers: this.snap.answers.map(mark), saved: this.snap.saved === saved ? mark(saved) : this.snap.saved });
+    })();
+    this.writes.add(job);
+    job.finally(() => this.writes.delete(job));
+  }
+
+  /** Every answer write still in flight has finished (the end of a check-in waits for it). */
+  async flushWrites() {
+    await Promise.all([...this.writes]);
+  }
+
+  /**
+   * The confirmation window after a saved answer: Next is offered; the
+   * spoken "noted" (sayOk) plays inside it; Sakhi moves on after CONFIRM_MS
+   * or at once when the ASHA taps Next.
+   */
+  private async confirm(my: number, sayOk: boolean) {
+    const ms = this.opts.confirmMs ?? CONFIRM_MS;
+    const began = Date.now();
+    let tapped = false;
+    const tap = new Promise<void>((resolve) => {
+      this.confirmEnd = () => {
+        tapped = true;
+        resolve();
+      };
+    });
+    // "Noted" first; Next is offered only once it has finished playing
+    // (a tap can never cut Sakhi off mid-line).
+    if (sayOk) await this.speakLine(SAKHI_REPLIES[this.lang].ok);
+    if (my === this.token && !tapped) {
+      this.set({ confirming: true });
+      const left = Math.max(ms - (Date.now() - began), Math.min(NEXT_MIN_MS, ms));
+      if (left > 0) await Promise.race([this.wait(left), tap]);
+    }
+    this.confirmEnd = null;
+    if (my === this.token) this.set({ confirming: false });
+  }
+
   /** Sound of the next question started: measure the turn gap. */
   private markGap() {
+    this.closeTimeline();
     if (this.gapFrom === null) return;
     const ms = Date.now() - this.gapFrom;
     this.gapFrom = null;
     this.set({ gapMs: ms });
     voiceDb.logEvent(this.sessionId, 'turn_gap', ms).catch(() => {});
+  }
+
+  /**
+   * The next prompt's audio started (t5): the last turn's timeline is
+   * complete. Each step is persisted as ms after t0 (prompt end), plus the
+   * one that matters most: t5 - t2, her last word to Sakhi's next prompt.
+   */
+  private closeTimeline() {
+    const tl = this.tl;
+    if (!tl || tl.t2 === undefined) return;
+    this.tl = null;
+    const t5 = Date.now();
+    const rel = (t?: number) => (t === undefined ? null : t - tl.t0);
+    const steps: [string, number | null][] = [
+      ['t1_first_pcm', rel(tl.t1)],
+      ['t2_vad_end', rel(tl.t2)],
+      ['t3_nlu_match', rel(tl.t3)],
+      ['t4_db_queued', rel(tl.t4)],
+      ['t5_next_prompt', rel(t5)],
+      ['post_speech_ms', t5 - tl.t2],
+    ];
+    for (const [kind, ms] of steps) if (ms !== null) voiceDb.logEvent(this.sessionId, kind, ms).catch(() => {});
+    vlog('run', `Q${tl.i + 1} timeline (ms after the prompt ended): ${steps.map(([k, v]) => `${k.split('_')[0]} ${v ?? '-'}`).join(', ')}`);
   }
 
   // ---- STT queue ---------------------------------------------------------------
@@ -1018,24 +1392,36 @@ export class SakhiEngine {
 
   private async transcribe(i: number) {
     const uri = this.audio.get(i);
+    const started = Date.now();
+    // The transcript of this very answer from the stream (or an early
+    // upload): it is used the moment it lands, with no second upload and
+    // without waiting for the recording to reach the disk.
+    const spec = this.spec.get(i);
+    this.spec.delete(i);
+    const reuse = spec && spec.voiced === this.voicedAtEnd.get(i) ? await spec.result : null;
+    if (reuse) vlog('stt', `Q${i + 1}: transcript ready ${Date.now() - (this.endedAt.get(i) ?? started)} ms after her last word`);
     // Never upload a WAV that is still being written.
-    const written = await (this.written.get(i) ?? Promise.resolve(true));
-    const body = uri && written ? answerBody(uri) : null;
-    if (!uri || !body) {
+    const written = reuse ? true : await (this.written.get(i) ?? Promise.resolve(true));
+    const body = reuse ? null : uri && written ? answerBody(uri) : null;
+    if (!reuse && (!uri || !body)) {
       if (uri && !written) vlog('err', `Q${i + 1}: answer audio could not be saved`);
       this.heard.get(i)?.(null);
       return;
     }
-    const started = Date.now();
     for (let attempt = 0; attempt < STT_TRIES; attempt++) {
       try {
-        const r = await gateway.stt(body, this.lang);
+        const r = attempt === 0 && reuse ? reuse : await gateway.stt(body as Blob, this.lang);
         vlog('stt', `ok ${Date.now() - started} ms (server ${r.ms} ms) Q${i + 1} "${short(r.text, 60)}"`);
         const outcome = this.apply(i, r.text, r.en);
-        this.heard.get(i)?.(outcome);
+        const waiting = this.heard.get(i);
+        if (waiting) waiting(outcome);
+        // Late (the talk moved on while it was being written): the saved
+        // card of that question is brought up to date here.
+        else if (outcome && typeof outcome !== 'string') this.commit(i, outcome.complete ? 'saved' : 'unclear').catch(() => {});
         voiceDb.updateTurn(this.sessionId, i, { transcript: r.text, transcript_en: r.en, stt_status: 'done', stt_ms: Date.now() - started, audio_uri: null }).catch(() => {});
         voiceDb.logEvent(this.sessionId, 'stt', Date.now() - started).catch(() => {});
-        deleteAnswer(uri);
+        // (a transcript that came early: the file may still be being written; delete it once it is)
+        if (uri) (this.written.get(i) ?? Promise.resolve(true)).then(() => deleteAnswer(uri)).catch(() => {});
         this.audio.delete(i);
         this.written.delete(i);
         return;
@@ -1094,6 +1480,7 @@ export class SakhiEngine {
     const draft = me?.draft ?? {};
     const prev = draft[q.id];
     store.recordAnswer(this.mother.id, q.id, rec);
+    this.recs.set(i, rec);
     this.patchLine(i, { danger: rec.danger });
     const codes = (rec.signs ?? []).map((sg) => SIGN_RULE[sg]).filter((c): c is RuleCode => !!c && RULES[c].severity !== 'watch');
     if (!codes.length && q.rule) codes.push(q.rule);
@@ -1101,12 +1488,21 @@ export class SakhiEngine {
     const hits = evaluate({ ...draft, [q.id]: rec }, clinicalFacts(me?.clinical));
     const code: RuleCode = hits.some((h) => h.code === 'PE-04') && codes.includes('PE-03') ? 'PE-04' : worst(codes);
     this.set({ alerts: [...this.snap.alerts.filter((a) => a.idx !== i), { idx: i, qid: q.id, code, text: rec.value, prev }] });
+    // An URGENT sign stops the questionnaire even when this question already
+    // raised a plain notice: a bare "yes" to "bleeding or discharge?" flags it
+    // at once, and the clarified "bleeding" must still stop everything.
+    const urgent = (rec.signs ?? []).filter((sg) => URGENT_SIGNS.has(sg) && !this.acted.has(sg) && !this.urgentRaised.has(sg));
+    if (urgent.length) {
+      urgent.forEach((sg) => this.urgentRaised.add(sg));
+      this.noticed.add(i);
+      Haptic.warning();
+      this.urgentQueue.push({ idx: i, qid: q.id, code, signs: urgent, text: rec.value });
+      return;
+    }
     if (this.noticed.has(i)) return;
     this.noticed.add(i);
     Haptic.warning();
-    const urgent = (rec.signs ?? []).filter((sg) => URGENT_SIGNS.has(sg) && !this.acted.has(sg));
-    if (urgent.length) this.urgentQueue.push({ idx: i, qid: q.id, code, signs: urgent, text: rec.value });
-    else this.notices.push(SAKHI_REPLIES[this.lang].danger);
+    this.notices.push(SAKHI_REPLIES[this.lang].danger);
   }
 
   // ---- end -----------------------------------------------------------------------
@@ -1121,6 +1517,8 @@ export class SakhiEngine {
     }
     this.mic?.dispose();
     this.mic = null;
+    // Every answer row on disk before the check-in is closed (writes run behind the talk).
+    await this.flushWrites();
     vlog('run', 'all questions asked; waiting for owed transcripts');
     // Wait for owed transcripts (bounded), then one more try at the outbox.
     const until = Date.now() + FINISH_WAIT_MS;
@@ -1189,8 +1587,17 @@ export class SakhiEngine {
     this.run(this.snap.idx, my);
   }
 
-  /** Next: end the answer now (or move on if nothing was said). */
+  /**
+   * Next. After a saved answer (the confirmation window): move on now. While
+   * listening: end the answer now (or move on if nothing was said).
+   */
   next() {
+    if (this.confirmEnd) {
+      vlog('run', `next tapped on the saved answer of Q${this.snap.idx + 1}`);
+      this.confirmEnd();
+      if (!this.remote) this.speaker?.stop();
+      return;
+    }
     if (this.snap.stage !== 'listening' && this.snap.stage !== 'hearing') return;
     vlog('run', `next tapped on Q${this.snap.idx + 1}`);
     if (this.remote) this.remote.next();

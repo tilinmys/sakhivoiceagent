@@ -100,3 +100,6 @@ video/**/snapshots/
 # STT end-to-end eval: synthesized audio and run logs are regenerated (scripts/stt_eval)
 scripts/stt_eval/audio/
 scripts/stt_eval/*.log
+
+# Her trailer video project (local only, never pushed)
+her space video/

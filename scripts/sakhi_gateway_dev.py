@@ -9,7 +9,9 @@
 3. opens a Cloudflare quick tunnel to it (the cloudflared binary the app's
    Metro tunnel already uses)
 4. writes app/.env.local: EXPO_PUBLIC_SAKHI_GATEWAY=<public url>/api/sakhi
-   (phones) and EXPO_PUBLIC_SAKHI_GATEWAY_LOCAL=http://localhost:8787/api/sakhi
+   (phones), EXPO_PUBLIC_SAKHI_GATEWAY_LAN=http://<this PC's Wi-Fi IP>:8787/api/sakhi
+   (phones on the same Wi-Fi: the app races it against the tunnel) and
+   EXPO_PUBLIC_SAKHI_GATEWAY_LOCAL=http://localhost:8787/api/sakhi
    (the desktop browser)
    Phones do NOT use this address: the app's own tunnel (npm run tunnel)
    forwards /api/sakhi/* to this gateway (app/metro.config.js), so the app
@@ -40,7 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 PORT = int(os.getenv("SAKHI_GATEWAY_PORT", "8787"))
-WATCH = [ROOT / "api" / "index.py", ROOT / "sakhi_gateway.py", ROOT / "sakhi_ws.py", ROOT / "vercel_common.py", ROOT / "voice_catalog.py", Path(__file__).resolve()]
+WATCH = [ROOT / "api" / "index.py", ROOT / "sakhi_gateway.py", ROOT / "sakhi_ws.py", ROOT / "sakhi_stream.py", ROOT / "sakhi_audio.py", ROOT / "vercel_common.py", ROOT / "voice_catalog.py", Path(__file__).resolve()]
 
 
 def load_env(path: Path) -> int:
@@ -100,6 +102,10 @@ def make_front(inner_port: int, ws_handler=None):
     app.on_cleanup.append(cleanup)
     if ws_handler is not None:
         app.router.add_get("/api/sakhi/ws", ws_handler)
+    # Streaming STT (sakhi_stream.py): light (aiohttp only), loaded with the front.
+    import sakhi_stream
+
+    app.router.add_get("/api/sakhi/stt/stream", sakhi_stream.handle)
     app.router.add_route("*", "/{tail:.*}", proxy)
     return app
 
@@ -148,11 +154,33 @@ def mtimes() -> dict[Path, float]:
     return {p: p.stat().st_mtime for p in WATCH if p.exists()}
 
 
+def lan_ip() -> str | None:
+    """This PC's address on the Wi-Fi / LAN (the interface that routes out; nothing is sent)."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+
+
 def write_env_local(public: str | None) -> None:
     """app/.env.local: the gateway's addresses and its token, for the app (dev only)."""
     lines = ["# Written by scripts/sakhi_gateway_dev.py (dev only)\n"]
     if public:
         lines.append(f"EXPO_PUBLIC_SAKHI_GATEWAY={public}\n")
+        # The phone's streaming STT WebSocket: Metro's tunnel carries only plain HTTP; this one carries WebSockets.
+        lines.append(f"EXPO_PUBLIC_SAKHI_GATEWAY_WS={public}\n")
+    ip = lan_ip()
+    if ip:
+        lines += [
+            "# A phone on the same Wi-Fi reaches this PC directly (~5-20 ms instead of the\n",
+            "# tunnel's 60-700 ms); the app races both and uses whichever answers first.\n",
+            f"EXPO_PUBLIC_SAKHI_GATEWAY_LAN=http://{ip}:{PORT}/api/sakhi\n",
+        ]
     lines += [
         "# The desktop browser (Expo web on localhost) uses this PC's gateway directly.\n",
         f"EXPO_PUBLIC_SAKHI_GATEWAY_LOCAL=http://localhost:{PORT}/api/sakhi\n",

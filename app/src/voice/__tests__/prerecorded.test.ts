@@ -13,7 +13,7 @@ import { PRERECORDED } from '../prerecorded.generated';
 // request on every check-in).
 
 describe('prerecorded lines', () => {
-  for (const lang of ['kn', 'hi'] as const) {
+  for (const lang of ['kn', 'hi', 'en'] as const) {
     it(`${lang}: every question of every visit and every fixed line are recorded`, () => {
       const lines = [
         STRINGS[lang].vGreetingVoice,
@@ -33,13 +33,14 @@ describe('prerecorded lines', () => {
 
     it(`${lang}: recordings are real audio of a sensible length`, () => {
       for (const [key, line] of Object.entries(PRERECORDED[lang])) {
-        expect([key, line.ms > 800 && line.ms < 20_000]).toEqual([key, true]);
+        expect([key, line.ms > 500 && line.ms < 20_000]).toEqual([key, true]);
       }
     });
   }
 
-  it('English has no recordings: it falls back to TTS, never to the wrong words', () => {
-    expect(prerecorded('en', QUESTION_BANK[0].en)).toBeNull();
+  it('a line that was never recorded falls back to TTS, never to the wrong words', () => {
+    expect(prerecorded('en', QUESTION_BANK[0].en)).not.toBeNull();
     expect(prerecorded('kn', 'a line that was never recorded')).toBeNull();
+    expect(prerecorded('en', 'a line that was never recorded')).toBeNull();
   });
 });

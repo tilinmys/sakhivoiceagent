@@ -65,6 +65,17 @@ def model_dir() -> str:
     return snapshot_download(REPO_ID, local_files_only=True)
 
 
+def max_tokens_for(seconds: float) -> int:
+    """Decoder budget for an answer of `seconds`: 10 tokens a second + 16, at most 96.
+
+    Real speech ends the decode itself (end of text) long before this, so the
+    per-second budget is generous and never cuts a real answer short; the
+    96-token ceiling is what bounds noise (measured: a 20 s noise clip 2.3 s
+    instead of 10-27 s, which had timed every later answer out on the GPU).
+    """
+    return min(96, 16 + int(10 * seconds))
+
+
 class Engine:
     """The model, its GPU lock, and the decode routing."""
 
@@ -124,17 +135,21 @@ class Engine:
                 text = self.transcribe_long(asr, wav, lang=use_lang, mode=use_mode)
                 return self._out(text, use_lang, use_mode, lid_conf, seconds, t)
             use_mode = mode or (routing.default_mode(lang) if lang else "native")
-            text, lid = asr.transcribe(wav, lang=lang, mode=use_mode, return_lid=True, allowed_langs=allowed)
+            # Bounded decode: real speech needs ~5 tokens a second; noise makes
+            # the decoder ramble for hundreds of tokens (measured: a 20 s noisy
+            # clip took 10-27 s and timed every later answer out on the GPU).
+            limit = max_tokens_for(seconds)
+            text, lid = asr.transcribe(wav, lang=lang, mode=use_mode, return_lid=True, allowed_langs=allowed, max_new_tokens=limit)
             detected = lid["lang"]
             conf = next((float(p) for code, p in lid["topk"] if code == detected), None)
             if routing.should_redecode_english(lang, detected, text):
                 # Weak English LID: Latin words under a kn / hi label are English.
-                text = asr.transcribe(wav, lang="en", mode=mode or routing.default_mode("en"))
+                text = asr.transcribe(wav, lang="en", mode=mode or routing.default_mode("en"), max_new_tokens=limit)
                 en_conf = next((float(p) for code, p in lid["topk"] if code == "en"), None)
                 return self._out(text, "en", mode or routing.default_mode("en"), en_conf, seconds, t, redecoded=True)
             if lang is None and mode is None and detected == "en":
                 # Auto mode landed on English: English is read in mixed mode.
-                text = asr.transcribe(wav, lang="en", mode="mixed")
+                text = asr.transcribe(wav, lang="en", mode="mixed", max_new_tokens=limit)
                 use_mode = "mixed"
             return self._out(text, detected, use_mode, conf, seconds, t)
 

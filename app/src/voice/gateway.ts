@@ -23,6 +23,19 @@ const PUBLIC = (process.env.EXPO_PUBLIC_SAKHI_GATEWAY ?? '').replace(/\/+$/, '')
 const LOCAL = (process.env.EXPO_PUBLIC_SAKHI_GATEWAY_LOCAL ?? '').replace(/\/+$/, '');
 const onLocalWeb = Platform.OS === 'web' && typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname);
 const BASE = onLocalWeb && LOCAL ? LOCAL : PUBLIC;
+// Expo Go on a phone on the same Wi-Fi as the dev PC reaches the gateway
+// DIRECTLY (written by scripts/sakhi_gateway_dev.py). Measured from the PC:
+// the tunnel is ~60-80 ms a request warm and ~700 ms cold; the LAN ~5-20 ms.
+// Both are raced at health() and the first to answer carries the
+// request/response traffic (STT, TTS). The live / WebSocket paths stay on
+// BASE (they need the public HTTPS host).
+const LAN = (process.env.EXPO_PUBLIC_SAKHI_GATEWAY_LAN ?? '').replace(/\/+$/, '');
+const ROUTES = onLocalWeb || !LAN ? [BASE] : [LAN, BASE].filter((b, i, a) => b && a.indexOf(b) === i);
+/** The route STT / TTS use now (the race winner; falls back to BASE when the LAN fails). */
+let route = BASE;
+/** Last request on `route`: an idle connection is re-warmed before she finishes speaking. */
+let lastUse = 0;
+const WARM_AFTER_MS = 10_000;
 const TOKEN = process.env.EXPO_PUBLIC_SAKHI_GATEWAY_TOKEN ?? '';
 const OPEN_MS = 30_000;
 const TRIP_AFTER = 3;
@@ -56,6 +69,19 @@ async function withTimeout<T>(ms: number, run: (signal: AbortSignal) => Promise<
   }
 }
 
+/** The first promise to resolve; rejects with every error only when all reject (Promise.any, which Hermes may lack). */
+function firstOk<T>(ps: Promise<T>[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const errs: unknown[] = [];
+    ps.forEach((p) =>
+      p.then(resolve, (e) => {
+        errs.push(e);
+        if (errs.length === ps.length) reject(errs);
+      }),
+    );
+  });
+}
+
 function record(ok: boolean) {
   if (ok) {
     fails = 0;
@@ -79,26 +105,49 @@ export const gateway = {
       vlog('gate', 'NOT CONFIGURED (EXPO_PUBLIC_SAKHI_GATEWAY is empty): demo mode, phone voice only');
       return { stt: false, tts: false };
     }
+    // Race every route; the first healthy answer wins (lowest round trip) and
+    // its connection is now open and warm for the first answer's upload.
     const t = Date.now();
-    try {
-      return await withTimeout(5000, async (signal) => {
-        const res = await fetch(`${BASE}/health`, { headers: headers(), signal });
-        if (!res.ok) {
-          vlog('err', `gateway health HTTP ${res.status} (${BASE})`);
-          return { stt: false, tts: false };
-        }
+    const probe = (base: string) =>
+      withTimeout(5000, async (signal) => {
+        const res = await fetch(`${base}/health`, { headers: headers(), signal });
+        if (!res.ok) throw new GatewayError(`health ${res.status}`, true);
         const body = (await res.json()) as { stt?: boolean; tts?: boolean; provider?: string };
-        vlog('gate', `${BASE} ok ${Date.now() - t} ms, provider ${body.provider ?? '?'}, stt ${!!body.stt}, tts ${!!body.tts}`);
-        return { stt: !!body.stt, tts: !!body.tts };
+        return { base, body, ms: Date.now() - t };
       });
+    try {
+      const win = await firstOk(ROUTES.map(probe));
+      route = win.base;
+      lastUse = Date.now();
+      const { body } = win;
+      vlog('gate', `${route} ok ${win.ms} ms${ROUTES.length > 1 ? ` (fastest of ${ROUTES.length} routes)` : ''}, provider ${body.provider ?? '?'}, stt ${!!body.stt}, tts ${!!body.tts}`);
+      return { stt: !!body.stt, tts: !!body.tts };
     } catch (e) {
-      vlog('err', `gateway unreachable after ${Date.now() - t} ms (${BASE}): ${String((e as Error)?.message ?? e)}`);
+      const errs = Array.isArray(e) ? e : [e];
+      vlog('err', `gateway unreachable after ${Date.now() - t} ms (${ROUTES.join(', ')}): ${errs.map((x) => String((x as Error)?.message ?? x)).join('; ')}`);
       return { stt: false, tts: false };
     }
   },
 
+  /** The route STT / TTS go over now (for the log and tests). */
+  get route() {
+    return route;
+  },
+
+  /**
+   * Keep the connection warm: called when she starts speaking. An idle
+   * connection (TCP + TLS, and the tunnel's own hop) costs ~0.6 s on the
+   * first request after a pause; a tiny health request now, while she is
+   * still talking, means her answer's upload rides an open connection.
+   */
+  warm() {
+    if (!BASE || this.offline || Date.now() - lastUse < WARM_AFTER_MS) return;
+    lastUse = Date.now();
+    withTimeout(4000, (signal) => fetch(`${route}/health`, { headers: headers(), signal })).catch(() => {});
+  },
+
   ttsUrl(text: string, lang: Lang) {
-    return `${BASE}/tts?lang=${lang}&text=${encodeURIComponent(text)}`;
+    return `${route}/tts?lang=${lang}&text=${encodeURIComponent(text)}`;
   },
 
   ttsHeaders: (prio: TtsPriority): Record<string, string> => ({ ...headers(), 'X-Sakhi-Priority': prio }),
@@ -177,7 +226,8 @@ export const gateway = {
     if (this.offline) throw new GatewayError('offline', true);
     try {
       const out = await withTimeout(timeoutMs, async (signal) => {
-        const res = await fetch(`${BASE}/stt?lang=${lang}`, {
+        lastUse = Date.now();
+        const res = await fetch(`${route}/stt?lang=${lang}`, {
           method: 'POST',
           headers: { ...headers(), 'Content-Type': 'audio/wav' },
           body: body as Blob,
@@ -193,8 +243,17 @@ export const gateway = {
       return out;
     } catch (e) {
       const err = e instanceof GatewayError ? e : new GatewayError(String(e), true);
-      // Busy (429) is not offline: it must not trip the breaker.
-      if (err.retryable && err.message !== 'stt 429') record(false);
+      // The Wi-Fi route failed at the network level (she walked out of range,
+      // another network): straight to the tunnel; the caller's retry uses it.
+      if (route !== BASE && !/^stt \d/.test(err.message)) {
+        vlog('gate', `LAN route failed (${err.message}): switching to ${BASE}`);
+        route = BASE;
+        throw err;
+      }
+      // Only a dead NETWORK trips the breaker. A reachable gateway that
+      // answered 5xx / 429 (the provider hung or was busy: measured, 1 call
+      // in 20 on Gnani REST) is not "no internet": it must never show offline.
+      if (err.retryable && !/^stt \d/.test(err.message)) record(false);
       throw err;
     }
   },

@@ -15,13 +15,14 @@ import { LiveBridge } from '@/components/voice/live-bridge';
 import { Colors, Layout } from '@/constants/theme';
 import { ME_ASHA } from '@/data/care-network';
 import { dayPlanStore } from '@/data/day-plan';
-import { questionCount, questionText, RULES, visitFor, type Visit } from '@/data/mockScreening';
+import { groupsFor } from '@/data/clinical';
+import { IF_NEEDED, questionById, questionCount, questionText, RULES, VISIT_SECTIONS, visitFor, type Visit } from '@/data/mockScreening';
 import { store, useAshaMothers, useMother, type MotherRecord } from '@/data/store';
 import { useOnboarding, useT } from '@/features/onboarding/context';
 import { STRINGS, type Lang, type StringKey } from '@/i18n/strings';
 import { goBack } from '@/lib/nav';
 import { DIRECT_IDLE, DirectSession, type DirectSnapshot } from '@/voice/direct';
-import { SakhiEngine, type AskReason, type Line, type Snapshot } from '@/voice/engine';
+import { SakhiEngine, type AskReason, type Line, type Saved, type Snapshot } from '@/voice/engine';
 import { SIGN_LABEL } from '@/voice/nlu/intake';
 import { LIVE_IDLE, LiveSession, type LiveSnapshot } from '@/voice/live';
 
@@ -177,7 +178,9 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
   const held = snap.held || !!urgent;
   const total = engine.questions.length;
   const talking = !held && (snap.stage === 'asking' || snap.stage === 'listening' || snap.stage === 'hearing');
-  const listening = !held && (snap.stage === 'listening' || snap.stage === 'hearing');
+  // An answer was just written to the phone: shown as saved, Next offered.
+  const confirming = !held && snap.confirming;
+  const listening = !held && !confirming && (snap.stage === 'listening' || snap.stage === 'hearing');
   const isLive = snap.transport !== 'phone' && !snap.liveLost;
   // Clamped: the engine's index can point one past the last question while finishing.
   const q = engine.questions[Math.min(snap.idx, total - 1)];
@@ -185,6 +188,8 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
     ? t('urgentTitle')
     : held
     ? t('vHeld')
+    : confirming
+    ? `${t('vSavedTitle')} ✓`
     : snap.stage === 'preparing'
       ? (direct ? wsSnap.stage === 'connecting' : liveSnap.stage === 'connecting')
         ? t('vConnecting')
@@ -211,12 +216,14 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
   const cta = intro
     ? {
         label: t('sStart'),
-        enabled: consented && (direct ? wsSnap.stage !== 'idle' : liveSnap.available !== null),
+        // Never waits for the live-agent check (it took 3.4 s in the field
+        // with the agent down): unknown yet = the phone pipeline.
+        enabled: consented && (direct ? wsSnap.stage !== 'idle' : true),
         icon: 'mic' as const,
         haptic: 'medium' as const,
         // Direct: the socket, even if it is still connecting (Start waits for
         // it, and falls back to the phone if the server cannot be reached).
-        onPress: () => engine.start((direct ? ws : liveSnap.available ? live : null) ?? undefined),
+        onPress: () => engine.start((direct ? ws : liveSnap.available === true ? live : null) ?? undefined),
       }
     : urgent
       ? { label: t('urgentReferred'), enabled: true, icon: 'checkCircle' as const, haptic: 'medium' as const, onPress: () => engine.acknowledgeUrgent('referred') }
@@ -250,7 +257,7 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
                 <SakhiOrb state={orb} size={52} />
               </View>
               <View style={styles.flex} accessibilityLiveRegion="polite">
-                <AppText variant="heading" color={urgent ? Colors.cherry : listening ? Colors.sage : Colors.ink} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
+                <AppText variant="heading" color={urgent ? Colors.cherry : listening || confirming ? Colors.sage : Colors.ink} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>
                   {urgent ? status : held ? t('vHeldShort') : status}
                 </AppText>
                 <View style={styles.meta}>
@@ -290,11 +297,16 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
               )}
             </View>
 
+            {/* What the last answer was SAVED as (written to the phone first):
+                the ASHA confirms it at a glance, without listening back. */}
+            {!!snap.saved && <SavedCard saved={snap.saved} fresh={confirming} t={t} />}
+
             <View style={styles.controls}>
-              {/* Hands-free: Sakhi moves on by herself. These two are small helpers
-                  (the mother did not hear; she refuses / skip), never the main action. */}
-              <ControlButton icon="reset" label={t('vRepeat')} onPress={() => engine.repeat()} disabled={!talking} />
-              <ControlButton icon="forward" label={t('vNext')} onPress={() => engine.next()} disabled={!listening} />
+              {/* Hands-free: Sakhi moves on by herself. Repeat is a small helper
+                  (the mother did not hear). Next appears ONLY once her answer is
+                  saved, to move on without waiting; never while she is answering. */}
+              <ControlButton icon="reset" label={t('vRepeat')} onPress={() => engine.repeat()} disabled={!talking || confirming} />
+              {confirming && !snap.isPromptPlaying && <ControlButton icon="forward" label={t('vNext')} onPress={() => engine.next()} primary />}
             </View>
           </View>
         )
@@ -344,6 +356,7 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
               {t(visit === 1 ? 'visitHint1' : visit === 2 ? 'visitHint2' : 'visitHint3')}
             </AppText>
           </View>
+          <QuestionPlan visit={visit} lang={appLanguage} t={t} />
           <View style={styles.steps}>
             {INTRO_STEPS.map((x, i) => (
               <View key={x.text} style={styles.stepRow}>
@@ -537,6 +550,20 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
         </View>
       )}
 
+      {/* Every answer saved so far (a real check-in): what is in her record
+          now, question by question. Corrections are made on the review screen. */}
+      {!intro && !(snap.mode === 'demo' && !isLive) && snap.answers.length > 0 && (
+        <View style={styles.thread}>
+          <AppText variant="overline" color={Colors.inkMuted}>
+            {/* n counts rows WRITTEN to the phone's database (the tick), not answers in memory */}
+            {t('vSavedList', { n: snap.answers.filter((a) => a.persisted).length, total }).toLocaleUpperCase()}
+          </AppText>
+          {[...snap.answers].reverse().map((a) => (
+            <SavedRow key={a.qid} saved={a} t={t} />
+          ))}
+        </View>
+      )}
+
       {/* Testing tools: only without a microphone or speech service. */}
       {!intro && snap.mode === 'demo' && !isLive && snap.stage !== 'done' && snap.stage !== 'finishing' && (
         <View style={styles.tools}>
@@ -579,6 +606,64 @@ function Conversation({ mother, direct }: { mother: MotherRecord; direct: boolea
 }
 
 /** One line of the conversation. Sakhi on the left, the ASHA on the right. */
+/**
+ * The questionnaire of this visit, as the ANC framework lays it out: Sakhi's
+ * questions under their section headings (A-D on the first visit), then what
+ * the ASHA enters herself (measurements, examination, tests, follow-up),
+ * which is never asked by voice. Collapsed by default: one tap to check.
+ */
+function QuestionPlan({ visit, lang, t }: { visit: Visit; lang: Lang; t: ReturnType<typeof useT> }) {
+  const [open, setOpen] = useState(false);
+  const sections = VISIT_SECTIONS[visit];
+  const n = sections.reduce((k, s) => k + s.ids.length, 0);
+  const entries = [...groupsFor(visit).map((g) => g.title[lang]), t('secLabTests')];
+  return (
+    <View style={styles.plan}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen((o) => !o)} style={styles.planHead}>
+        <AppText variant="bodyStrong" style={styles.flex}>
+          {t('sWillAsk', { n })}
+        </AppText>
+        <View style={open && styles.flip}>
+          <Icon name="down" size={18} color={Colors.inkMuted} />
+        </View>
+      </Pressable>
+      {open && (
+        <View style={styles.planBody}>
+          {sections.map((sec) => (
+            <View key={sec.title} style={styles.planSection}>
+              <AppText variant="overline" color={Colors.inkMuted}>
+                {t(sec.title).toLocaleUpperCase()}
+              </AppText>
+              {sec.ids.map((id) => {
+                const q = questionById(id);
+                if (!q) return null;
+                return (
+                  <View key={id} style={styles.planRow}>
+                    <AppText variant="body" style={styles.flex}>
+                      {questionText(q, lang)}
+                    </AppText>
+                    {IF_NEEDED.has(id) && (
+                      <AppText variant="caption" color={Colors.inkMuted}>
+                        {t('sIfNeeded')}
+                      </AppText>
+                    )}
+                  </View>
+                );
+              })}
+            </View>
+          ))}
+          <View style={styles.planSection}>
+            <AppText variant="overline" color={Colors.inkMuted}>
+              {t('sYouEnter').toLocaleUpperCase()}
+            </AppText>
+            <AppText variant="body">{entries.join(' · ')}</AppText>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
 function Bubble({ line, t, reduceMotion }: { line: Line; t: ReturnType<typeof useT>; reduceMotion: boolean }) {
   const mine = line.from === 'asha';
   const soft = line.pending || line.offline;
@@ -608,6 +693,97 @@ function Bubble({ line, t, reduceMotion }: { line: Line; t: ReturnType<typeof us
         )}
       </View>
     </Animated.View>
+  );
+}
+
+const SAVED_GOOD = new Set<Saved['status']>(['saved', 'prefilled']);
+
+/** Status words for a saved answer that is not a plain "Saved". */
+function savedNote(s: Saved, t: ReturnType<typeof useT>) {
+  switch (s.status) {
+    case 'unclear':
+      return t('vSavedUnclear');
+    case 'no_answer':
+      return t('vSavedNoAnswer');
+    case 'skipped':
+      return t('vSavedSkipped');
+    case 'prefilled':
+      return t('vSavedPrefilled');
+    case 'offline':
+      return t('vSavedOffline');
+    default:
+      return null;
+  }
+}
+
+/**
+ * The confirmation card: the last answer as it went into her record. Green
+ * tick = understood and written to the phone; amber = kept but needs a look
+ * in review; red border = a danger sign.
+ */
+function SavedCard({ saved, fresh, t }: { saved: Saved; fresh: boolean; t: ReturnType<typeof useT> }) {
+  const good = SAVED_GOOD.has(saved.status);
+  const tint = saved.danger ? Colors.cherry : good ? Colors.sage : Colors.pumpkinInk;
+  const note = savedNote(saved, t);
+  const label = `${t('vSavedTitle')} · Q${saved.idx + 1}: ${saved.value}`;
+  return (
+    <View
+      style={[styles.saved, good ? styles.savedGood : styles.savedCheck, saved.danger && styles.savedDanger, !fresh && styles.savedOld]}
+      accessible
+      accessibilityLabel={label}
+      accessibilityLiveRegion="polite"
+    >
+      <Icon name={good && !saved.danger ? 'checkCircle' : 'warning'} size={22} color={tint} weight="fill" />
+      <View style={styles.flex}>
+        <View style={styles.savedHead}>
+          <AppText variant="label" color={tint} numberOfLines={1} style={styles.flex}>
+            {`${note ?? t('vSavedTitle')} · Q${saved.idx + 1}`}
+          </AppText>
+          {saved.latencyMs !== null && (
+            <AppText variant="label" color={Colors.inkMuted}>
+              {`${(saved.latencyMs / 1000).toFixed(1)} s`}
+            </AppText>
+          )}
+        </View>
+        <AppText variant="bodyStrong" numberOfLines={2}>
+          {saved.value}
+        </AppText>
+        {!!saved.heard && saved.heard !== saved.value && (
+          <AppText variant="caption" color={Colors.inkMuted} numberOfLines={1}>
+            {t('vSavedHeard', { text: saved.heard })}
+          </AppText>
+        )}
+        {!!saved.writeFailed && (
+          <AppText variant="caption" color={Colors.cherry}>
+            {t('vNotOnPhone')}
+          </AppText>
+        )}
+      </View>
+    </View>
+  );
+}
+
+/** One line of the saved-answers list: the question and what was saved. */
+function SavedRow({ saved, t }: { saved: Saved; t: ReturnType<typeof useT> }) {
+  const good = SAVED_GOOD.has(saved.status);
+  const note = savedNote(saved, t);
+  return (
+    <View style={[styles.savedRow, saved.danger && styles.savedDanger]}>
+      <Icon name={good && !saved.danger ? 'checkCircle' : 'warning'} size={18} color={saved.danger ? Colors.cherry : good ? Colors.sage : Colors.pumpkinInk} weight="fill" />
+      <View style={styles.flex}>
+        <AppText variant="caption" color={Colors.inkMuted} numberOfLines={1}>
+          {`Q${saved.idx + 1} · ${saved.question}`}
+        </AppText>
+        <AppText variant="bodyStrong" color={saved.danger ? Colors.cherry : Colors.ink}>
+          {saved.value}
+        </AppText>
+        {!!note && saved.status !== 'saved' && (
+          <AppText variant="caption" color={Colors.pumpkinInk}>
+            {note}
+          </AppText>
+        )}
+      </View>
+    </View>
   );
 }
 
@@ -734,6 +910,13 @@ const styles = StyleSheet.create({
   alert: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12, borderRadius: 16, borderWidth: 2, borderColor: Colors.cherry, backgroundColor: Colors.cherryMist },
   undo: { minHeight: 40, justifyContent: 'center', paddingHorizontal: 14, borderRadius: 20, borderWidth: 1.5, borderColor: Colors.cherry, backgroundColor: Colors.surface },
   thread: { gap: 10 },
+  saved: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 16, borderWidth: 1.5 },
+  savedGood: { backgroundColor: Colors.sageTint, borderColor: Colors.sage },
+  savedCheck: { backgroundColor: Colors.orangeTint, borderColor: Colors.pumpkin },
+  savedDanger: { borderColor: Colors.cherry, borderWidth: 2 },
+  savedOld: { opacity: 0.75 },
+  savedHead: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  savedRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 12, borderRadius: 14, backgroundColor: Colors.surface, borderWidth: 1, borderColor: Colors.bandLine },
   row: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, maxWidth: '90%' },
   rowMine: { alignSelf: 'flex-end' },
   avatar: { width: 26, height: 26, borderRadius: 13, backgroundColor: Colors.orangeTint, alignItems: 'center', justifyContent: 'center' },
@@ -751,6 +934,12 @@ const styles = StyleSheet.create({
   boxOn: { backgroundColor: Colors.cherry },
   liveNote: { alignSelf: 'stretch', flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 4 },
   steps: { alignSelf: 'stretch', gap: 2, padding: 6, borderRadius: 20, backgroundColor: Colors.orangeTint },
+  plan: { alignSelf: 'stretch', borderRadius: 20, borderWidth: 1, borderColor: Colors.outline, backgroundColor: Colors.surface, overflow: 'hidden' },
+  planHead: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 52, paddingHorizontal: 16 },
+  planBody: { gap: 16, paddingHorizontal: 16, paddingBottom: 16 },
+  planSection: { gap: 6 },
+  planRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
+  flip: { transform: [{ rotate: '180deg' }] },
   stepRow: { flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 52, paddingHorizontal: 10 },
   stepNum: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.surface },
   tools: { borderRadius: Layout.radius, borderWidth: 1.5, borderStyle: 'dashed', borderColor: Colors.outline },

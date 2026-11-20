@@ -120,6 +120,52 @@ export const CLINICAL_GROUPS: Group[] = [
     ],
   },
   {
+    // Framework, visits 2 and 3: "Visit details: date of visit, gestational age in weeks".
+    id: 'visitDetails',
+    title: { en: 'Visit details', kn: 'ಭೇಟಿಯ ವಿವರ', hi: 'विज़िट का विवरण' },
+    source: 'mcp',
+    visits: [2, 3],
+    fields: [
+      { id: 'visitDate', label: { en: 'Date of visit', kn: 'ಭೇಟಿಯ ದಿನಾಂಕ', hi: 'विज़िट की तारीख' }, visits: [2, 3], kind: 'text' },
+      { id: 'gaWeeks', label: { en: 'Gestational age', kn: 'ಗರ್ಭದ ವಾರಗಳು', hi: 'गर्भ के सप्ताह' }, visits: [2, 3], kind: 'number', unit: 'weeks', min: 4, max: 42 },
+    ],
+  },
+  {
+    // Framework, section 7: "Medication and vaccination records" (the ASHA's, from the MCP card).
+    id: 'medsVaccines',
+    title: { en: 'Medicines and vaccines', kn: 'ಮಾತ್ರೆಗಳು ಮತ್ತು ಲಸಿಕೆ', hi: 'दवाइयां और टीके' },
+    source: 'mcp',
+    visits: ALL,
+    fields: [
+      { id: 'ifaGiven', label: { en: 'IFA tablets given', kn: 'ಕಬ್ಬಿಣಾಂಶ (IFA) ಮಾತ್ರೆ ನೀಡಲಾಗಿದೆ', hi: 'IFA गोलियां दी गईं' }, visits: ALL, kind: 'yesno' },
+      { id: 'calciumGiven', label: { en: 'Calcium tablets given', kn: 'ಕ್ಯಾಲ್ಸಿಯಂ ಮಾತ್ರೆ ನೀಡಲಾಗಿದೆ', hi: 'कैल्शियम गोलियां दी गईं' }, visits: [2, 3], kind: 'yesno' },
+      {
+        id: 'tdDose',
+        label: { en: 'Td vaccine', kn: 'ಟಿಡಿ (Td) ಲಸಿಕೆ', hi: 'टीडी (Td) टीका' },
+        visits: ALL,
+        kind: 'choice',
+        options: [
+          { id: 'td1', label: { en: 'Td-1 given', kn: 'Td-1 ನೀಡಲಾಗಿದೆ', hi: 'Td-1 दिया' } },
+          { id: 'td2', label: { en: 'Td-2 given', kn: 'Td-2 ನೀಡಲಾಗಿದೆ', hi: 'Td-2 दिया' } },
+          { id: 'booster', label: { en: 'Booster given', kn: 'ಬೂಸ್ಟರ್ ನೀಡಲಾಗಿದೆ', hi: 'बूस्टर दिया' } },
+          { id: 'notDue', label: { en: 'Not due', kn: 'ಈಗ ಬೇಕಿಲ್ಲ', hi: 'अभी नहीं' } },
+        ],
+      },
+      { id: 'otherMeds', label: { en: 'Other medicines given', kn: 'ನೀಡಿದ ಇತರ ಮಾತ್ರೆಗಳು', hi: 'दी गई अन्य दवाइयां' }, visits: ALL, kind: 'text' },
+    ],
+  },
+  {
+    // Framework, visit 3: "Risk assessment: existing risk factors and newly identified concerns".
+    id: 'risk',
+    title: { en: 'Risk assessment', kn: 'ಅಪಾಯದ ಮೌಲ್ಯಮಾಪನ', hi: 'जोखिम आकलन' },
+    source: 'examination',
+    visits: [3],
+    fields: [
+      { id: 'riskFactors', label: { en: 'Existing risk factors', kn: 'ಈಗಿರುವ ಅಪಾಯದ ಅಂಶಗಳು', hi: 'मौजूदा जोखिम कारक' }, visits: [3], kind: 'text' },
+      { id: 'newConcerns', label: { en: 'Newly identified concerns', kn: 'ಹೊಸದಾಗಿ ಕಂಡ ಸಮಸ್ಯೆಗಳು', hi: 'नई पाई गई समस्याएं' }, visits: [3], kind: 'text' },
+    ],
+  },
+  {
     id: 'birthPlan',
     title: { en: 'Birth preparedness', kn: 'ಹೆರಿಗೆ ಸಿದ್ಧತೆ', hi: 'प्रसव की तैयारी' },
     source: 'mcp',
@@ -130,10 +176,32 @@ export const CLINICAL_GROUPS: Group[] = [
       { id: 'supportPerson', label: { en: 'Support person', kn: 'ಜೊತೆಗೆ ಬರುವವರು', hi: 'साथ जाने वाले' }, visits: [3], kind: 'text' },
     ],
   },
+  {
+    // Framework: "Follow-up: referral, doctor's advice and next ANC date".
+    id: 'followUp',
+    title: { en: 'Follow-up', kn: 'ಮುಂದಿನ ಕ್ರಮ', hi: 'आगे की देखभाल' },
+    source: 'mcp',
+    visits: ALL,
+    fields: [
+      {
+        id: 'referral',
+        label: { en: 'Referral', kn: 'ರೆಫರಲ್', hi: 'रेफ़रल' },
+        visits: ALL,
+        kind: 'choice',
+        options: [
+          { id: 'none', label: { en: 'Not needed', kn: 'ಬೇಕಿಲ್ಲ', hi: 'ज़रूरत नहीं' } },
+          { id: 'phc', label: { en: 'Referred to PHC', kn: 'ಪ್ರಾ.ಆ.ಕೇಂದ್ರಕ್ಕೆ ಕಳುಹಿಸಲಾಗಿದೆ', hi: 'PHC भेजा' } },
+          { id: 'hospital', label: { en: 'Referred to hospital (FRU)', kn: 'ಆಸ್ಪತ್ರೆಗೆ (FRU) ಕಳುಹಿಸಲಾಗಿದೆ', hi: 'अस्पताल (FRU) भेजा' } },
+        ],
+      },
+      { id: 'doctorAdvice', label: { en: "Doctor's advice", kn: 'ವೈದ್ಯರ ಸಲಹೆ', hi: 'डॉक्टर की सलाह' }, visits: ALL, kind: 'text' },
+      { id: 'nextAnc', label: { en: 'Next ANC date', kn: 'ಮುಂದಿನ ತಪಾಸಣೆ ದಿನಾಂಕ', hi: 'अगली जांच की तारीख' }, visits: ALL, kind: 'text' },
+    ],
+  },
 ];
 
 // The Lab report (app/asha/lab/[id].tsx): lab and scan results only.
-// Medicines and vaccines are not recorded here.
+// Medicines given and vaccines are entered with the visit (group 'medsVaccines').
 export const CLINICAL_TESTS: Test[] = [
   { id: 'hb', label: { en: 'Haemoglobin (Hb)', kn: 'ಹಿಮೋಗ್ಲೋಬಿನ್ (Hb)', hi: 'हीमोग्लोबिन (Hb)' }, visits: ALL, result: { kind: 'number', unit: 'g/dL', min: 3, max: 20, decimals: true } },
   {

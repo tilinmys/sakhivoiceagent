@@ -1,10 +1,11 @@
-import type { OutboxRow, SessionRow, TurnRow, VoiceDb } from './db-types';
+import type { AnswerRow, OutboxRow, SessionRow, TurnRow, VoiceDb } from './db-types';
 
 // Persistence on web (the browser preview): the same interface as
 // db.native.ts, kept in memory. Phones use SQLite.
 
 const sessions = new Map<string, SessionRow>();
 const turns = new Map<string, TurnRow>();
+const answers = new Map<string, AnswerRow>();
 const key = (s: string, i: number) => `${s}#${i}`;
 const owed = new Set(['pending', 'offline', 'failed']);
 
@@ -40,6 +41,12 @@ export const voiceDb: VoiceDb = {
   },
   async turns(sessionId) {
     return [...turns.values()].filter((t) => t.session_id === sessionId).sort((a, b) => a.idx - b.idx);
+  },
+  async saveAnswer(a) {
+    answers.set(`${a.session_id}#${a.qid}`, { ...a, saved_at: Date.now() });
+  },
+  async answers(sessionId) {
+    return [...answers.values()].filter((a) => a.session_id === sessionId).sort((a, b) => a.idx - b.idx);
   },
   async getDiagnostics() {
     const all = [...turns.values()];

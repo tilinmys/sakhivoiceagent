@@ -66,6 +66,17 @@ function numberWords() {
   for (const [full, stem, v] of KN_TENS) {
     add(full, v);
     for (const [suf, u] of KN_FUSED_UNITS) add(stem + suf, v + u);
+    // A consonant-initial unit is also joined with a virama, in two spellings
+    // people (and Gnani) write: ಇಪ್ಪತ್ತ್ + ನಾಲ್ಕು = ಇಪ್ಪತ್ತ್ನಾಲ್ಕು, and the
+    // short ಇಪ್ಪತ್ + ನಾಲ್ಕು = ಇಪ್ಪತ್ನಾಲ್ಕು (24). Field: Gnani returned
+    // "ನನಗೆ ಇಪ್ಪತ್ತ್ನಾಲ್ಕು ವರ್ಷ", which was not read as a number, so the age
+    // was asked again.
+    const short = stem.slice(0, -1); // ಇಪ್ಪತ್ತ -> ಇಪ್ಪತ್
+    for (const [unit, u] of KN_FUSED_UNITS) {
+      if (!/^[ಕ-ಹ]/.test(unit)) continue; // vowel-sign units fuse without a virama (above)
+      add(`${stem}್${unit}`, v + u);
+      if (short.endsWith('್')) add(short + unit, v + u);
+    }
   }
   HI_WORDS.forEach((w, i) => add(w, i));
   HI_EXTRA.forEach(([w, v]) => add(w, v));

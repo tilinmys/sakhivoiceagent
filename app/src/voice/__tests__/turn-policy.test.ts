@@ -97,7 +97,7 @@ describe('danger-sign and slot follow-ups', () => {
     for (const lang of ['kn', 'hi', 'en'] as const) {
       const lines = allFollowUps(lang);
       // 2 fixed lines + the sign subsets (bleeding / discharge / leaking: 3; three 3-sign questions: 6 each)
-      expect(lines.length).toBe(2 + 3 + 6 + 6 + 6);
+      expect(lines.length).toBe(4 + 3 + 6 + 6 + 6 + 5); // 4 fixed lines; subsets of each sign set; 5 'which one' lines (bleedFluid and bleedLeak share theirs)
       expect(lines.every((l) => l && !l.includes('{'))).toBe(true);
     }
     expect(signsLine('kn', ['vision', 'swellFace'])).toBe('ಮತ್ತು ಕಣ್ಣು ಮಂಜಾಗುವುದು ಅಥವಾ ಮುಖ ಕೈಗಳಲ್ಲಿ ಊತ ಇದೆಯಾ?');

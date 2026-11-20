@@ -80,6 +80,15 @@ export class Mic {
     }
     this.fill = 0;
     this.firstBuffer = true;
+    // Android: playbackMode() left the session with allowsRecording false;
+    // some devices then hand AudioStream a silent / low-gain input. Restore
+    // the recording session first (the mic is still off while any prompt
+    // plays: half-duplex is kept by the engine, which starts the mic only
+    // after the line has finished). iOS switches its own category in
+    // AudioStream.start() and a mode change there costs ~0.8 s, so not there.
+    if (Platform.OS === 'android') {
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true, shouldRouteThroughEarpiece: false }).catch((e) => vlog('err', `record mode: ${String(e)}`));
+    }
     await this.stream.start();
     vlog('mic', `on ${Date.now() - t} ms`);
   }
@@ -124,12 +133,19 @@ export class Mic {
     if (this.scratch.length < outLen) this.scratch = new Int16Array(outLen);
     if (ratio === 1 && ch === 1) {
       this.scratch.set(raw.subarray(0, outLen));
+    } else if (ratio === 1) {
+      for (let i = 0; i < outLen; i++) this.scratch[i] = raw[i * ch];
     } else {
+      // Downsampling (44.1 / 48 kHz): a 3-tap [1 2 1] / 4 low-pass before the
+      // linear interpolation, so energy above 8 kHz does not fold back into
+      // the speech band (aliasing hiss the recogniser hears as noise). O(n).
+      const at = (k: number) => raw[Math.max(0, Math.min(inLen - 1, k)) * ch];
+      const lp = (k: number) => (at(k - 1) + 2 * at(k) + at(k + 1)) * 0.25;
       for (let i = 0; i < outLen; i++) {
         const pos = i * ratio;
         const j = Math.floor(pos);
-        const a = raw[j * ch];
-        const c = j + 1 < inLen ? raw[(j + 1) * ch] : a;
+        const a = lp(j);
+        const c = j + 1 < inLen ? lp(j + 1) : a;
         this.scratch[i] = a + (c - a) * (pos - j);
       }
     }

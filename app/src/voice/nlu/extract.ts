@@ -72,18 +72,29 @@ type Hit = { start: number; end: number; concepts: Concept[]; fixed: boolean; to
 
 let MATCHER: AhoCorasick<Payload> | null = null;
 let LATIN_WORDS: Map<number, [string, Payload][]> | null = null;
+/**
+ * Kannada / Devanagari single-word forms of 5+ code points, for the one-typo
+ * rescue in the Indic scripts (a recogniser's vowel-sign slip: ತಲೆನೊವು for
+ * ತಲೆನೋವು). Polarity words (yes / no / nothing / don't know) are NEVER
+ * fuzzy-matched: a typo must not turn an answer around.
+ */
+let INDIC_WORDS: [string, Payload][] | null = null;
+const INDIC = /^[\u0900-\u097F\u0C80-\u0CFF]{5,}$/;
+const NO_FUZZY: ReadonlySet<string> = new Set(['NEG', 'AFF', 'AFF_PRE', 'NOTHING', 'UNKNOWN']);
 let ORDINAL_MAP: Map<string, number> | null = null;
 
 function build() {
   if (MATCHER) return;
   const entries: [string, Payload][] = [];
   const latin = new Map<number, [string, Payload][]>();
+  const indic: [string, Payload][] = [];
   for (const e of LEXICON) {
     for (const f of e.forms) {
       const form = normalize(f);
       if (!form) continue;
       const payload = { concept: e.concept, fixed: e.fixed === 1 };
       entries.push([form, payload]);
+      if (INDIC.test(form) && !NO_FUZZY.has(e.concept)) indic.push([form, payload]);
       // single Latin words of 5+ letters also match with one typo
       if (/^[a-z]{5,}$/.test(form)) {
         const list = latin.get(form.length) ?? [];
@@ -94,6 +105,7 @@ function build() {
   }
   MATCHER = new AhoCorasick(entries);
   LATIN_WORDS = latin;
+  INDIC_WORDS = indic;
   ORDINAL_MAP = new Map(ORDINALS.map(([w, n]) => [normalize(w), n]));
 }
 
@@ -157,6 +169,16 @@ function matchesOf(text: string, tk: ReturnType<typeof tokenize>): Hit[] {
         covered.add(t);
         break;
       }
+    }
+  });
+  // the same rescue for Kannada / Hindi script: the whole word, or its stem
+  // (forms are often stems: ತಲೆನೋವ matches ತಲೆನೋವು / ತಲೆನೋವಿದೆ)
+  tk.tokens.forEach((tok, t) => {
+    if (covered.has(t) || !INDIC.test(tok)) return;
+    const hit = INDIC_WORDS?.find(([w]) => withinOneEdit(tok, w) || (tok.length > w.length && withinOneEdit(tok.slice(0, w.length), w)) || (tok.length > w.length + 1 && withinOneEdit(tok.slice(0, w.length + 1), w)));
+    if (hit) {
+      kept.push({ start: tk.starts[t], end: tk.ends[t], concepts: [hit[1].concept], fixed: hit[1].fixed, tokenStart: t, tokenEnd: t });
+      covered.add(t);
     }
   });
   return kept.sort((a, b) => a.start - b.start);

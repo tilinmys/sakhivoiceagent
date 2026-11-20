@@ -16,8 +16,14 @@ import { TtsQueue, type TtsPriority } from './tts-queue';
 //             LRU-capped at MAX_FILES (24 questions x 3 languages + prompts)
 //   queue     tts-queue.ts: the provider takes one request at a time; the
 //             line being said NOW skips the queue
-//   play      ONE reused player; a watchdog falls back if sound has not
-//             started within START_MS (never a silent 30 s wait)
+//   play      a FRESH player per line, created ahead (ready()) while the
+//             line before it plays, released when its line ends. Field log
+//             2026-11-13: a player REUSED after it had finished a line (a
+//             rewind of "ಸರಿ", or the next line replaced into it) sometimes
+//             never started on Android: 5 s lost, then a download. A fresh
+//             player started in ~30-140 ms every time.
+//             A line that does not start within START_MS is retried once on
+//             a new player before anything else is tried
 //   backup    no file within NET_WAIT_MS, gateway down or playback error ->
 //             the phone's own voice says the same words. This is reported
 //             (onVoice('backup')) and shown on screen, never silent.
@@ -30,10 +36,14 @@ const NET_WAIT_MS = 6000;
  * How long the player may take to start before the backup voice is used.
  * Android and iOS both need up to 5s on budget hardware or in Expo Go.
  */
-const START_MS = 5000;
+const START_MS = 1500;
+/** Players loaded ahead for the coming lines (each is an ExoPlayer / AVPlayer: keep few). */
+const READY_MAX = 3;
 const SAFETY_MS = 30_000;
 /** How long a recorded line may take to reach the phone before the next-best audio is used. */
 const ASSET_WAIT_MS = 6000;
+/** Recorded lines downloaded at once while the check-in starts. */
+const PRELOAD_PARALLEL = 4;
 
 /** In-flight asset download promises so concurrent calls share the single request. */
 const assetDownloads = new Map<number, Promise<string | null>>();
@@ -77,7 +87,8 @@ function hash(s: string) {
 
 export class Speaker {
   private player: AudioPlayer | null = null;
-  private playerUri: string | null = null;
+  /** Loaded, never-played players for the next lines, by source key (insertion order = age). */
+  private readyPlayers = new Map<string, AudioPlayer>();
   private dir = new Directory(Paths.cache, 'sakhi-tts');
   private queue: TtsQueue<File>;
   private done: (() => void) | null = null;
@@ -146,12 +157,20 @@ export class Speaker {
   async preloadRecorded(texts: string[]) {
     const t = Date.now();
     let n = 0;
-    for (const text of texts) {
-      if (this.released) return;
-      const pre = prerecorded(this.lang, text);
-      if (pre && (await localAsset(pre.asset))) n++;
-    }
-    vlog('tts', `recorded lines on the phone: ${n} in ${Date.now() - t} ms`);
+    // Four downloads at a time, in speaking order (in Expo Go each line comes
+    // from Metro through the tunnel: one by one, 70 lines took long enough
+    // that a line could be due before it was on the phone, and its wait was
+    // heard as a gap or, past ASSET_WAIT_MS, as a different voice).
+    const queue = texts.map((text) => prerecorded(this.lang, text)).filter((p): p is NonNullable<typeof p> => !!p);
+    let next = 0;
+    const worker = async () => {
+      while (next < queue.length && !this.released) {
+        const pre = queue[next++];
+        if (await localAsset(pre.asset)) n++;
+      }
+    };
+    await Promise.all(Array.from({ length: PRELOAD_PARALLEL }, worker));
+    vlog('tts', `recorded lines on the phone: ${n}/${queue.length} in ${Date.now() - t} ms`);
   }
 
   /** Every line of the check-in, downloaded one by one in speaking order. */
@@ -160,9 +179,34 @@ export class Speaker {
     vlog('tts', `warm-up: ${texts.length} lines, ${this.queue.pending} to download`);
   }
 
+  /**
+   * Load the player for a line about to be said (the "ಸರಿ" after an answer,
+   * the next question), so speak() only has to press play. Recorded lines
+   * only (they are on the phone); never blocks.
+   */
+  ready(text: string) {
+    const pre = prerecorded(this.lang, text);
+    if (!pre || this.released) return;
+    const key = `asset:${pre.asset}`;
+    if (this.readyPlayers.has(key)) return;
+    localAsset(pre.asset)
+      .then((uri) => {
+        if (!uri || this.released || this.readyPlayers.has(key)) return;
+        this.readyPlayers.set(key, createAudioPlayer({ uri }, { updateInterval: 50 }));
+        while (this.readyPlayers.size > READY_MAX) {
+          const [oldKey, old] = this.readyPlayers.entries().next().value as [string, AudioPlayer];
+          this.readyPlayers.delete(oldKey);
+          drop(old);
+        }
+      })
+      .catch(() => {});
+  }
+
   /** The next question: ahead of warm-up, behind what is being said now. */
   prefetch(text: string) {
-    if (prerecorded(this.lang, text)) return Promise.resolve(null);
+    const pre = prerecorded(this.lang, text);
+    // A recorded line: make sure ITS file is on the phone first (jumps the preload queue).
+    if (pre) return localAsset(pre.asset).then(() => null);
     return this.fetchAudio(text, 'next');
   }
 
@@ -205,7 +249,13 @@ export class Speaker {
         const uri = await Promise.race([localAsset(pre.asset), new Promise<null>((r) => setTimeout(() => r(null), ASSET_WAIT_MS))]);
         if (my !== this.gen) return;
         if (!uri) throw new Error(`not on the phone after ${ASSET_WAIT_MS} ms`);
-        await this.playSource({ uri }, `asset:${pre.asset}`, text, onStart);
+        try {
+          await this.playSource({ uri }, `asset:${pre.asset}`, text, onStart);
+        } catch (e) {
+          if (my !== this.gen) return;
+          vlog('err', `recorded line did not start (${String((e as Error)?.message ?? e)}): once more on a new player`);
+          await this.playSource({ uri }, `retry:${pre.asset}`, text, onStart);
+        }
         return;
       } catch (e) {
         vlog('err', `recorded line failed to play: ${String((e as Error)?.message ?? e)}`);
@@ -235,21 +285,28 @@ export class Speaker {
     await this.device(text, onStart);
   }
 
-  /** Play a file on the phone (a recorded line or a download); `key` identifies it so a re-ask rewinds instead of reloading. */
+  /** Play a file on the phone (a recorded line or a download) on a fresh (or ready-loaded) player. */
   private playSource(source: { uri: string }, key: string, text: string, onStart?: () => void) {
     return new Promise<void>((resolve, reject) => {
-      const player = this.player ?? createAudioPlayer(null, { updateInterval: 100 });
+      const ready = this.readyPlayers.get(key);
+      if (ready) this.readyPlayers.delete(key);
+      const player = ready ?? createAudioPlayer(source, { updateInterval: 50 });
+      // The line before is over: its player goes (a finished player is never reused).
+      if (this.player && this.player !== player) drop(this.player);
       this.player = player;
       const t0 = Date.now();
       let started = false;
+      let done = false;
       let safety = setTimeout(() => finish('safety timeout'), SAFETY_MS);
       const cleanup = () => {
+        done = true;
         sub.remove();
         clearTimeout(safety);
         clearTimeout(watchdog);
         if (this.done === stopped) this.done = null;
       };
       const finish = (why: string) => {
+        if (done) return;
         cleanup();
         vlog('play', `${why} ${((Date.now() - t0) / 1000).toFixed(1)} s "${short(text, 24)}"`);
         resolve();
@@ -262,44 +319,27 @@ export class Speaker {
         if (!started && s.playing) {
           started = true;
           clearTimeout(watchdog);
-          vlog('play', `SAKHI VOICE start ${Date.now() - t0} ms (${s.duration ? s.duration.toFixed(1) : '?'} s) "${short(text, 24)}"`);
+          vlog('play', `SAKHI VOICE start ${Date.now() - t0} ms${ready ? ' (pre-loaded)' : ''} (${s.duration ? s.duration.toFixed(1) : '?'} s) "${short(text, 24)}"`);
           this.onVoice('sakhi');
           onStart?.();
           if (s.duration > 0) {
             clearTimeout(safety);
-            safety = setTimeout(() => finish('safety (no finish event)'), s.duration * 1000 + 1500);
+            safety = setTimeout(() => finish('done (by its length)'), s.duration * 1000 + 400);
           }
         }
         if (s.didJustFinish) finish('done');
+        // Some Android builds never send didJustFinish: at the end and stopped is finished too.
+        else if (started && !s.playing && s.duration > 0 && s.currentTime >= s.duration - 0.12) finish('done (at end)');
       });
       const watchdog = setTimeout(() => {
         cleanup();
-        this.playerUri = null; // reload next time
-        try {
-          player.pause();
-        } catch {
-          // ignore
-        }
-        try {
-          this.player?.remove();
-          this.player = null;
-        } catch {
-          // ignore
-        }
+        if (this.player === player) this.player = null;
+        drop(player);
         reject(new Error(`no sound within ${START_MS} ms`));
       }, START_MS);
       this.done = stopped;
       try {
         player.volume = 1;
-        if (this.playerUri === key) {
-          // Same line again (a re-ask): rewind instead of reloading.
-          player.seekTo(0).catch(() => {});
-        } else {
-          player.replace(source);
-          this.playerUri = key;
-          // Android ExoPlayer: reset position so a player reaching STATE_ENDED restarts cleanly
-          player.seekTo(0).catch(() => {});
-        }
         player.play();
       } catch (e) {
         cleanup();
@@ -354,9 +394,10 @@ export class Speaker {
     this.stop();
     this.released = true;
     this.queue.close();
-    this.player?.remove();
+    if (this.player) drop(this.player);
     this.player = null;
-    this.playerUri = null;
+    this.readyPlayers.forEach(drop);
+    this.readyPlayers.clear();
   }
 
   /** Keep the cache under MAX_FILES: oldest files go first. */
@@ -372,5 +413,19 @@ export class Speaker {
     } catch {
       // a full cache is not worth failing a question over
     }
+  }
+}
+
+/** Stop and release a player (never throws: it may already be gone). */
+function drop(p: AudioPlayer) {
+  try {
+    p.pause();
+  } catch {
+    // ignore
+  }
+  try {
+    p.remove();
+  } catch {
+    // ignore
   }
 }

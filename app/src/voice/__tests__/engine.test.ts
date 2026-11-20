@@ -5,6 +5,7 @@ import { store } from '@/data/store';
 import { STRINGS } from '@/i18n/strings';
 
 import type { RemoteAnswer } from '../live';
+import { whichLine } from '../nlu/followup';
 
 // The question engine (voice/engine.ts) is the app's state manager for a
 // check-in. These tests drive it with a fake remote voice (the WebSocket /
@@ -71,11 +72,24 @@ jest.mock('../gateway', () => {
       this.retryable = retryable;
     }
   }
-  return { GatewayError, gateway: { offline: false, health: async () => ({ stt: true, tts: true }), stt: jest.fn() } };
+  return { GatewayError, gateway: { offline: false, health: async () => ({ stt: true, tts: true }), stt: jest.fn(), warm: () => {} } };
 });
-jest.mock('../db', () => ({
-  voiceDb: { createSession: async () => {}, endSession: async () => {}, upsertTurn: async () => {}, updateTurn: async () => {}, logEvent: async () => {} },
-}));
+jest.mock('../db', () => {
+  // The answers table, kept in memory: what the "Saved" card claims must be in it.
+  const answers = new Map<string, { session_id: string; qid: string; value: string; status: string }>();
+  return {
+    answersTable: answers,
+    voiceDb: {
+      createSession: async () => {},
+      endSession: async () => {},
+      upsertTurn: async () => {},
+      updateTurn: async () => {},
+      logEvent: async () => {},
+      saveAnswer: async (a: { session_id: string; qid: string; value: string; status: string }) => void answers.set(`${a.session_id}#${a.qid}`, a),
+      answers: async () => [],
+    },
+  };
+});
 jest.mock('../answer-files', () => ({ saveAnswer: jest.fn(), answerBody: jest.fn(() => ({ wav: true })), deleteAnswer: jest.fn() }));
 
 // eslint-disable-next-line import/first
@@ -141,7 +155,7 @@ const TYPICAL: Record<string, string> = {
   confirmed: 'ಹೌದು ಆಸ್ಪತ್ರೆಯಲ್ಲಿ', deliveries: '1', losses: 'ಇಲ್ಲ', pastProblems: 'ಇಲ್ಲ ಏನೂ ತೊಂದರೆ ಇಲ್ಲ', csection: 'ಇಲ್ಲ', conditions: 'ಇಲ್ಲ',
   longIllness: 'ಇಲ್ಲ', medicines: 'ಕಬ್ಬಿಣ ಮತ್ತು ಕ್ಯಾಲ್ಸಿಯಂ', allergy: 'ಇಲ್ಲ', transfusion: 'ಇಲ್ಲ', bleedDischarge: 'ಇಲ್ಲ', feverPain: 'ಇಲ್ಲ ಏನೂ ಇಲ್ಲ',
   tobacco: 'ಇಲ್ಲ', concerns: 'ಏನೂ ಇಲ್ಲ', newProblems: 'ಇಲ್ಲ', bleedFluid: 'ಇಲ್ಲ', warning: 'ಇಲ್ಲ ಏನೂ ಇಲ್ಲ', movementFelt: 'ಹೌದು ಗೊತ್ತಾಗುತ್ತಿದೆ',
-  ifa: 'ಹೌದು ದಿನಾ ತಿನ್ನುತ್ತಿದ್ದೇನೆ', calcium: 'ಹೌದು', testsDone: 'ಹೌದು ಮಾಡಿಸಿದ್ದೇನೆ', followedAdvice: 'ಹೌದು', movement: 'ಹೌದು ಸರಿಯಾಗಿ ಆಡುತ್ತಿದೆ',
+  ifa: 'ಹೌದು ದಿನಾ ತಿನ್ನುತ್ತಿದ್ದೇನೆ', calcium: 'ಹೌದು', movement: 'ಹೌದು ಸರಿಯಾಗಿ ಆಡುತ್ತಿದೆ',
   movementLess: 'ಇಲ್ಲ', tummySize: 'ಇಲ್ಲ ಏನೂ ಬದಲಾವಣೆ ಇಲ್ಲ', bleedLeak: 'ಇಲ್ಲ', breathing: 'ಇಲ್ಲ', ironCalcium: 'ಹೌದು ದಿನಾ', deliveryPlace: 'ತಾಲೂಕು ಆಸ್ಪತ್ರೆ', support: 'ಹೌದು ಗಂಡ ಇದ್ದಾರೆ',
 };
 const typical = (asked: string) => {
@@ -157,10 +171,14 @@ beforeEach(() => {
 });
 afterEach(() => engines.forEach((e) => e.release()));
 
-/** Kavitha (21 weeks, checked before) is a second visit; `visit` picks another questionnaire. */
-function engineFor(id = 'kavitha', visit?: Visit) {
+/**
+ * Kavitha (21 weeks, checked before) is a second visit; `visit` picks another
+ * questionnaire. confirmMs: the "Saved" window after each answer (0 here so
+ * a whole check-in runs in milliseconds; its own tests set it).
+ */
+function engineFor(id = 'kavitha', visit?: Visit, confirmMs = 0) {
   const mother = store.get().find((m) => m.id === id)!;
-  const e = new SakhiEngine(mother, LANG, { warm: false, visit });
+  const e = new SakhiEngine(mother, LANG, { warm: false, visit, confirmMs });
   engines.push(e);
   return e;
 }
@@ -183,7 +201,7 @@ describe('SakhiEngine with a remote voice', () => {
     expect(store.get().find((m) => m.id === 'kavitha')!.draftVisit).toBe(2);
   });
 
-  it('a first visit asks the registration questions; a third visit the birth plan', async () => {
+  it('a first visit asks the registration questions; a third visit the 8 framework questions (birth plan is entered by the ASHA)', async () => {
     const first = engineFor('kavitha', 1);
     const r1 = new FakeRemote((t) => typical(t));
     await first.start(r1);
@@ -195,7 +213,9 @@ describe('SakhiEngine with a remote voice', () => {
     const r3 = new FakeRemote((t) => typical(t));
     await third.start(r3);
     await waitFor(() => third.getSnapshot().stage === 'done');
-    expect(r3.asked()).toContain(qText('deliveryPlace'));
+    expect(r3.asked()).toContain(qText('bleedLeak'));
+    expect(r3.asked()).toContain(qText('ironCalcium'));
+    for (const id of ['deliveryPlace', 'support', 'warning']) expect([id, r3.asked().includes(qText(id))]).toEqual([id, false]);
     expect(r3.asked()).not.toContain(qText('movementLess')); // "moving as usual: yes" settled it
   });
 
@@ -226,14 +246,14 @@ describe('SakhiEngine with a remote voice', () => {
 
   it('an answer that does not fill the question: "sorry, once more" + the SAME question, once', async () => {
     const e = engineFor();
-    const q = qText('testsDone');
+    const q = qText('movementFelt');
     let tries = 0;
     const remote = new FakeRemote((t) => (t === q ? text(++tries === 1 ? 'ಏನು' : 'ಹೌದು') : typical(t)));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
     const at = remote.events.indexOf(`ask:${q}`);
     expect(remote.events.slice(at, at + 3)).toEqual([`ask:${q}`, `say:${REASK_SORRY}`, `ask:${q}`]);
-    expect(draftOf().testsDone.value).toBe('Yes, done');
+    expect(draftOf().movementFelt.value).toBe('Yes, feels movements');
   });
 
   it('still unclear after the second try: recorded as not clear, flagged (danger question), flow goes on', async () => {
@@ -338,7 +358,7 @@ describe('SakhiEngine with a remote voice', () => {
     const at = (x: string) => ev.indexOf(x);
     expect(ev[at(`ask:${Q2[0]}`) + 1]).toBe(`say:${OK}`); // newProblems: understood -> noted
     expect(ev[at(`ask:${qText('feverPain')}`) + 1]).toBe(`say:${DANGER}`); // a danger answer: the danger line, no "noted"
-    expect(ev[ev.indexOf(`say:${qText('close')}`) - 1]).toBe(`ask:${qText('followedAdvice')}`); // straight to the closing line
+    expect(ev[ev.indexOf(`say:${qText('close')}`) - 1]).toBe(`ask:${qText('calcium')}`); // straight to the closing line
   });
 
   it('a lost connection continues on the phone at the SAME question, without asking it twice', async () => {
@@ -395,12 +415,31 @@ describe('SakhiEngine with a remote voice', () => {
 });
 
 describe('SakhiEngine on the phone (no remote)', () => {
-  const frame = (amp: number) => new Int16Array(320).fill(amp);
+  // A mic frame of `amp` RMS: her voice (a 200 Hz vowel, so it is voiced) when
+  // loud, the room's soft noise when quiet. Continuous phase across frames.
+  let phase = 0;
+  let seed = 1;
+  const frame = (amp: number) => {
+    const f = new Int16Array(320);
+    for (let k = 0; k < 320; k++) {
+      if (amp >= 200) f[k] = Math.round(amp * Math.SQRT2 * Math.sin((2 * Math.PI * 200 * phase++) / 16000));
+      else f[k] = Math.round(amp * 1.7 * (((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32) * 2 - 1));
+    }
+    return f;
+  };
+
+  /** Uploads of the answer FILE (answerBody), not the in-memory speculative ones. */
+  const fileUploads = () => gatewayMod.gateway.stt.mock.calls.filter((c) => !(c[0] instanceof Uint8Array)).length;
+  const specUploads = () => gatewayMod.gateway.stt.mock.calls.filter((c) => c[0] instanceof Uint8Array).length;
+  /** The speculative (in-memory) upload fails; the answer FILE is transcribed. */
+  const onlyTheFile = (text: string) =>
+    gatewayMod.gateway.stt.mockImplementation((body) => (body instanceof Uint8Array ? Promise.reject(new Error('down')) : Promise.resolve({ text, en: '', ms: 300 })));
 
   it('REGRESSION: an answer is uploaded only after its WAV is fully written', async () => {
     let written!: (ok: boolean) => void;
     answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://a0.wav', ready: new Promise<boolean>((r) => (written = r)) }));
-    gatewayMod.gateway.stt.mockResolvedValue({ text: 'ಇಲ್ಲ', en: '', ms: 300 });
+    gatewayMod.gateway.stt.mockReset();
+    onlyTheFile('ಇಲ್ಲ');
     const e = engineFor();
     await e.start();
     await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
@@ -410,14 +449,15 @@ describe('SakhiEngine on the phone (no remote)', () => {
     for (let i = 0; i < 70; i++) mic.cb(frame(26), 0); // quiet: end of answer
     await waitFor(() => answerFiles.saveAnswer.mock.calls.length === 1);
     await new Promise((r) => setTimeout(r, 30));
-    expect(gatewayMod.gateway.stt).not.toHaveBeenCalled(); // still writing
+    expect(fileUploads()).toBe(0); // still writing
     written(true);
-    await waitFor(() => gatewayMod.gateway.stt.mock.calls.length === 1);
+    await waitFor(() => fileUploads() === 1);
   });
 
   it('an answer that could not be saved is never uploaded', async () => {
     answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://a0.wav', ready: Promise.resolve(false) }));
     gatewayMod.gateway.stt.mockReset();
+    onlyTheFile('ಇಲ್ಲ');
     const e = engineFor();
     await e.start();
     await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
@@ -427,7 +467,74 @@ describe('SakhiEngine on the phone (no remote)', () => {
     for (let i = 0; i < 70; i++) mic.cb(frame(26), 0);
     await waitFor(() => answerFiles.saveAnswer.mock.calls.length >= 1);
     await new Promise((r) => setTimeout(r, 50));
-    expect(gatewayMod.gateway.stt).not.toHaveBeenCalled();
+    expect(fileUploads()).toBe(0);
+  });
+
+  it('LATENCY: at a 300 ms pause her answer is already sent; when the turn ends it is reused, never uploaded twice', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://s.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    gatewayMod.gateway.stt.mockResolvedValue({ text: 'ಇಲ್ಲ', en: '', ms: 200 });
+    const e = engineFor(); // second visit: "new problems?" first (a description: no early end)
+    await e.start();
+    await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    for (let i = 0; i < 15; i++) mic.cb(frame(26), 0);
+    for (let i = 0; i < 40; i++) mic.cb(frame(1300), 0);
+    for (let i = 0; i < 16; i++) mic.cb(frame(26), 0); // 320 ms of quiet: the pause
+    expect(specUploads()).toBe(1);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(micMod.Mic.last!.on).toBe(true); // a description: the hangover still runs
+    for (let i = 0; i < 60; i++) mic.cb(frame(26), 0);
+    await waitFor(() => !!store.get().find((m) => m.id === 'kavitha')!.draft?.newProblems);
+    expect(store.get().find((m) => m.id === 'kavitha')!.draft?.newProblems.value).toBe('No');
+    expect(fileUploads()).toBe(0); // the speculative transcript was the answer
+    expect(specUploads()).toBe(1);
+  });
+
+  it('LATENCY: a complete answer to a plain question ends the turn as soon as its transcript is back (no hangover)', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://n.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    gatewayMod.gateway.stt.mockResolvedValue({ text: 'ಕವಿತಾ', en: '', ms: 200 });
+    const e = engineFor('kavitha', 1); // first visit: "your full name?" first
+    await e.start();
+    await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    for (let i = 0; i < 15; i++) mic.cb(frame(26), 0);
+    for (let i = 0; i < 40; i++) mic.cb(frame(1300), 0);
+    for (let i = 0; i < 16; i++) mic.cb(frame(26), 0); // 320 ms quiet, hangover is 550+
+    // no more frames are fed: only the early end can finish this turn (the hangover never ran out)
+    await waitFor(() => answerFiles.saveAnswer.mock.calls.length === 1, 1000);
+    await waitFor(() => e.getSnapshot().answers.some((a) => a.qid === 'name'));
+    expect(fileUploads()).toBe(0);
+  });
+
+  it('SAFETY: talking on after the pause makes the early transcript stale: only the full answer is used', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://f.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let n = 0;
+    gatewayMod.gateway.stt.mockImplementation(async () => {
+      if (++n === 1) {
+        await gate; // the first (mid-name) transcript comes back only after she spoke again
+        return { text: 'ಕವಿ', en: '', ms: 200 };
+      }
+      return { text: 'ಕವಿತಾ ದೇವಿ', en: '', ms: 200 };
+    });
+    const e = engineFor('kavitha', 1);
+    await e.start();
+    await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    for (let i = 0; i < 15; i++) mic.cb(frame(26), 0);
+    for (let i = 0; i < 20; i++) mic.cb(frame(1300), 0);
+    for (let i = 0; i < 16; i++) mic.cb(frame(26), 0); // a pause mid-name
+    for (let i = 0; i < 20; i++) mic.cb(frame(1300), 0); // she goes on
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(answerFiles.saveAnswer).not.toHaveBeenCalled(); // the stale result did not end her turn
+    for (let i = 0; i < 70; i++) mic.cb(frame(26), 0);
+    await waitFor(() => e.getSnapshot().answers.some((a) => a.qid === 'name'));
+    expect(e.getSnapshot().answers.find((a) => a.qid === 'name')!.heard).toBe('ಕವಿತಾ ದೇವಿ');
   });
 
   it('a late transcript (after 3.5 s) is still waited for: her answer is understood before the next question', async () => {
@@ -522,6 +629,172 @@ function scripted(plan: Record<string, string[]>) {
 const S = STRINGS[LANG];
 const recordOf = (id: string) => store.get().find((m) => m.id === 'kavitha')!.draft?.[id];
 
+describe('SakhiEngine: field fixes (number hold, background save, Next after the line, turn telemetry)', () => {
+  let phase = 0;
+  let seed = 7;
+  const frame = (amp: number) => {
+    const f = new Int16Array(320);
+    for (let k = 0; k < 320; k++) {
+      if (amp >= 200) f[k] = Math.round(amp * Math.SQRT2 * Math.sin((2 * Math.PI * 200 * phase++) / 16000));
+      else f[k] = Math.round(amp * 1.7 * (((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32) * 2 - 1));
+    }
+    return f;
+  };
+  const speakerMod = jest.requireMock('../speaker') as { Speaker: { last: { speak: (t: string, onStart?: () => void) => Promise<void>; spoken: string[] } } };
+  const dbMock = jest.requireMock('../db') as { voiceDb: { logEvent: (...a: unknown[]) => Promise<void>; saveAnswer: (...a: unknown[]) => Promise<void> } };
+  const feed = (mic: { cb: (p: Int16Array, o: number) => void }, amp: number, n: number) => {
+    for (let k = 0; k < n; k++) mic.cb(frame(amp), 0);
+  };
+  async function answerName(e: SakhiEngine) {
+    await waitFor(() => e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    feed(mic, 26, 15);
+    feed(mic, 1300, 40);
+    feed(mic, 26, 16); // the name ends early (complete, not a number)
+    await waitFor(() => e.getSnapshot().answers.some((a) => a.qid === 'name'));
+    return mic;
+  }
+
+  it('NUMBERS: "ಇಪ್ಪತ್ತು ..." complete at 320 ms of quiet is held; the turn ends only after 650 ms of quiet', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://x.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    gatewayMod.gateway.stt.mockImplementationOnce(async () => ({ text: 'ಕವಿತಾ', en: '', ms: 100 })).mockImplementation(async () => ({ text: 'ಇಪ್ಪತ್ತು', en: '', ms: 100 }));
+    const e = engineFor('kavitha', 1);
+    await e.start();
+    await answerName(e);
+    await waitFor(() => e.getSnapshot().idx === 1 && e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    feed(mic, 26, 5);
+    feed(mic, 1300, 30);
+    feed(mic, 26, 16); // 320 ms quiet: transcript back, complete number, but held
+    await new Promise((r) => setTimeout(r, 20));
+    expect(answerFiles.saveAnswer).toHaveBeenCalledTimes(1); // only the name so far
+    feed(mic, 26, 17); // 660 ms quiet in all (the hangover would be ~0.8 s)
+    await waitFor(() => answerFiles.saveAnswer.mock.calls.length === 2, 1000);
+  });
+
+  it('NUMBERS: she says the second digit inside the hold: the held half-number is dropped', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://x.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    let n = 0;
+    gatewayMod.gateway.stt.mockImplementation(async () => ({ text: ['ಕವಿತಾ', 'ಇಪ್ಪತ್ತು'][n++] ?? 'ಇಪ್ಪತ್ತು ನಾಲ್ಕು', en: '', ms: 100 }));
+    const e = engineFor('kavitha', 1);
+    await e.start();
+    await answerName(e);
+    await waitFor(() => e.getSnapshot().idx === 1 && e.getSnapshot().stage === 'listening' && !!micMod.Mic.last?.on);
+    const mic = micMod.Mic.last!;
+    feed(mic, 26, 5);
+    feed(mic, 1300, 30);
+    feed(mic, 26, 16);
+    await new Promise((r) => setTimeout(r, 20));
+    feed(mic, 1300, 20); // "... ನಾಲ್ಕು"
+    feed(mic, 26, 60);
+    await waitFor(() => e.getSnapshot().answers.some((a) => a.qid === 'age'));
+    expect(draftOf().age.value).toContain('24');
+  });
+
+  it('SAVE: a slow database never holds the conversation; the tick comes when the row is written', async () => {
+    let release!: () => void;
+    const slow = new Promise<void>((r) => (release = r));
+    const orig = dbMock.voiceDb.saveAnswer;
+    dbMock.voiceDb.saveAnswer = () => slow;
+    try {
+      const e = engineFor();
+      const remote = new FakeRemote((t) => typical(t));
+      await e.start(remote);
+      await waitFor(() => remote.asked().length >= 3); // moved on twice with nothing written
+      expect(e.getSnapshot().answers[0].persisted).toBe(false);
+      expect(e.getSnapshot().answers[0].writeFailed).toBeUndefined(); // still writing: no warning shown
+      release();
+      await waitFor(() => e.getSnapshot().answers[0].persisted);
+    } finally {
+      dbMock.voiceDb.saveAnswer = orig;
+    }
+  });
+
+  it('SAVE: a write that keeps failing is retried, then the card says it is not on the phone', async () => {
+    const orig = dbMock.voiceDb.saveAnswer;
+    let tries = 0;
+    dbMock.voiceDb.saveAnswer = async () => {
+      tries++;
+      throw new Error('disk full');
+    };
+    try {
+      const e = engineFor('kavitha', undefined, 60_000);
+      const remote = new FakeRemote((t) => typical(t));
+      await e.start(remote);
+      await waitFor(() => !!e.getSnapshot().saved?.writeFailed, 4000);
+      expect(tries).toBe(3);
+    } finally {
+      dbMock.voiceDb.saveAnswer = orig;
+    }
+  });
+
+  it('NEXT: never offered while "noted" plays; offered once it has finished', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://x.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    gatewayMod.gateway.stt.mockResolvedValue({ text: 'ಕವಿತಾ', en: '', ms: 100 });
+    const e = engineFor('kavitha', 1, 60_000);
+    await e.start();
+    const sp = speakerMod.Speaker.last;
+    const seen: { text: string; confirming: boolean; playing: boolean }[] = [];
+    sp.speak = async (t, onStart) => {
+      sp.spoken.push(t);
+      onStart?.();
+      seen.push({ text: t, confirming: e.getSnapshot().confirming, playing: e.getSnapshot().isPromptPlaying });
+      await new Promise((r) => setTimeout(r, 30));
+      seen.push({ text: t, confirming: e.getSnapshot().confirming, playing: e.getSnapshot().isPromptPlaying });
+    };
+    await answerName(e);
+    await waitFor(() => e.getSnapshot().confirming);
+    expect(e.getSnapshot().isPromptPlaying).toBe(false);
+    const noted = seen.filter((x) => x.text === SAKHI_REPLIES[LANG].ok);
+    expect(noted.length).toBe(2);
+    expect(noted.every((x) => x.playing && !x.confirming)).toBe(true);
+    e.next();
+    await waitFor(() => e.getSnapshot().idx === 1);
+  });
+
+  it('TELEMETRY: each turn persists t1..t5 (ms after the prompt ended) and her last word -> next prompt', async () => {
+    answerFiles.saveAnswer.mockImplementation(() => ({ uri: 'file://x.wav', ready: Promise.resolve(true) }));
+    gatewayMod.gateway.stt.mockReset();
+    gatewayMod.gateway.stt.mockResolvedValue({ text: 'ಕವಿತಾ', en: '', ms: 100 });
+    const logged: string[] = [];
+    const orig = dbMock.voiceDb.logEvent;
+    dbMock.voiceDb.logEvent = async (_s, kind) => void logged.push(kind as string);
+    try {
+      const e = engineFor('kavitha', 1);
+      await e.start();
+      await answerName(e);
+      await waitFor(() => logged.includes('post_speech_ms'));
+      expect(logged).toEqual(expect.arrayContaining(['t1_first_pcm', 't2_vad_end', 't3_nlu_match', 't4_db_queued', 't5_next_prompt', 'post_speech_ms']));
+    } finally {
+      dbMock.voiceDb.logEvent = orig;
+    }
+  });
+});
+
+describe('SakhiEngine: the questionnaire clarifies a bare yes (field log 2026-11-17)', () => {
+  it('SAFETY: "ಆಗಿದೆ" to bleeding / discharge -> "which one?" -> "ರಕ್ತಸ್ರಾವ": the questionnaire STOPS (urgent), even after the first flag', async () => {
+    const e = engineFor('kavitha', 1);
+    const which = whichLine(LANG, ['bleeding', 'discharge']);
+    const remote = new FakeRemote(scripted({ bleedDischarge: ['ಆಗಿದೆ ಹಾಗಿದೆ'], [which]: ['ರಕ್ತಸ್ರಾವ ಆಗಿದೆ'] }));
+    await e.start(remote);
+    await waitFor(() => !!e.getSnapshot().urgent);
+    expect(remote.asked()).toContain(which); // asked once, right after the bare yes
+    expect(e.getSnapshot().urgent?.signs).toEqual(['bleeding']);
+    expect(recordOf('bleedDischarge')).toMatchObject({ value: 'Bleeding', danger: true });
+  });
+
+  it('first pregnancy: the skipped history questions are saved as "None: first pregnancy", never "Not clear"', async () => {
+    const e = engineFor('kavitha', 1);
+    const remote = new FakeRemote(scripted({ firstPregnancy: ['ಹೌದು ಹೌದು'] }));
+    await e.start(remote);
+    await waitFor(() => e.getSnapshot().stage === 'done');
+    for (const id of ['losses', 'pastProblems', 'csection']) expect([id, recordOf(id)?.value]).toEqual([id, 'None: first pregnancy']);
+  });
+});
+
 describe('SakhiEngine: partial answers, commands and edge cases', () => {
   it('a half answer is followed up with ONLY the missing part, then moves on', async () => {
     const e = engineFor('kavitha', 1);
@@ -575,62 +848,62 @@ describe('SakhiEngine: partial answers, commands and edge cases', () => {
 
   it('"say it again" repeats the question without using up the re-ask', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ testsDone: ['ಮತ್ತೊಮ್ಮೆ ಹೇಳಿ', 'ಹೌದು'] }));
+    const remote = new FakeRemote(scripted({ movementFelt: ['ಮತ್ತೊಮ್ಮೆ ಹೇಳಿ', 'ಹೌದು'] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
-    expect(remote.asked().filter((t) => t === qText('testsDone'))).toHaveLength(2);
+    expect(remote.asked().filter((t) => t === qText('movementFelt'))).toHaveLength(2);
     expect(remote.events).not.toContain(`say:${REASK_SORRY}`);
-    expect(recordOf('testsDone')?.value).toBe('Yes, done');
+    expect(recordOf('movementFelt')?.value).toBe('Yes, feels movements');
   });
 
   it('"one minute" waits for her (longer), then takes the answer', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ testsDone: ['ಒಂದು ನಿಮಿಷ'], [S.vWaiting]: ['ಹೌದು'] }));
+    const remote = new FakeRemote(scripted({ movementFelt: ['ಒಂದು ನಿಮಿಷ'], [S.vWaiting]: ['ಹೌದು'] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
     expect(remote.asked()).toContain(S.vWaiting);
-    expect(recordOf('testsDone')?.value).toBe('Yes, done');
+    expect(recordOf('movementFelt')?.value).toBe('Yes, feels movements');
   });
 
   it('"skip" moves on at once and records it as skipped, with no alarm', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ followedAdvice: ['ಮುಂದಿನ ಪ್ರಶ್ನೆ'] }));
+    const remote = new FakeRemote(scripted({ calcium: ['ಮುಂದಿನ ಪ್ರಶ್ನೆ'] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
-    expect(remote.asked().filter((t) => t === qText('followedAdvice'))).toHaveLength(1);
-    expect(recordOf('followedAdvice')).toEqual({ value: 'Skipped (check)', danger: false });
+    expect(remote.asked().filter((t) => t === qText('calcium'))).toHaveLength(1);
+    expect(recordOf('calcium')).toEqual({ value: 'Skipped (check)', danger: false });
   });
 
   it('silence: one nudge, then recorded as no answer; never stuck', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ followedAdvice: ['', ''] }));
+    const remote = new FakeRemote(scripted({ calcium: ['', ''] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
     expect(remote.events.filter((t) => t === `say:${REASK}`)).toHaveLength(1);
-    expect(remote.asked().filter((t) => t === qText('followedAdvice'))).toHaveLength(2);
+    expect(remote.asked().filter((t) => t === qText('calcium'))).toHaveLength(2);
     expect(e.getSnapshot().answered).toBe(questionsFor(2).length);
   });
 
   it('nobody speaks for two questions in a row: Sakhi says so once, holds, and asks again on Continue', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ testsDone: ['', ''], followedAdvice: ['', ''] }));
+    const remote = new FakeRemote(scripted({ ifa: ['', ''], calcium: ['', ''] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().held);
     const asked = remote.asked().length;
     expect(remote.events.filter((t) => t === `say:${S.vAway}`)).toHaveLength(1);
-    expect(recordOf('followedAdvice')).toBeUndefined(); // not recorded as "no answer": it is asked again
+    expect(recordOf('calcium')).toBeUndefined(); // not recorded as "no answer": it is asked again
     await new Promise((r) => setTimeout(r, 50));
     expect(remote.asked()).toHaveLength(asked); // nothing asked while held
     e.continueAfterHold();
     await waitFor(() => e.getSnapshot().stage === 'done');
-    expect(remote.asked().filter((t) => t === qText('followedAdvice'))).toHaveLength(3);
-    expect(recordOf('followedAdvice')?.value).toBeTruthy();
+    expect(remote.asked().filter((t) => t === qText('calcium'))).toHaveLength(3);
+    expect(recordOf('calcium')?.value).toBeTruthy();
     expect(e.getSnapshot().held).toBe(false);
   });
 
   it('one silent question, then an answer: the silence count starts over (no hold)', async () => {
     const e = engineFor();
-    const remote = new FakeRemote(scripted({ ifa: ['', ''], testsDone: ['', ''] }));
+    const remote = new FakeRemote(scripted({ movementFelt: ['', ''], calcium: ['', ''] }));
     await e.start(remote);
     await waitFor(() => e.getSnapshot().stage === 'done');
     expect(remote.events).not.toContain(`say:${S.vAway}`);
@@ -644,5 +917,55 @@ describe('SakhiEngine: partial answers, commands and edge cases', () => {
     const turns = remote.asked().slice(remote.asked().indexOf(qText('warning')), remote.asked().indexOf(qText('feverPain')));
     expect(turns.length).toBeLessThanOrEqual(5);
     expect(recordOf('warning')?.danger).toBe(true); // an unclear danger question is flagged for the doctor
+  });
+});
+
+describe('SakhiEngine: every answer is SAVED to the phone, then confirmed to the ASHA', () => {
+  const dbMod = jest.requireMock('../db') as { answersTable: Map<string, { session_id: string; qid: string; value: string; status: string }> };
+
+  it('each question ends with its answer written to the answers table, and the card says what was saved', async () => {
+    const e = engineFor();
+    const remote = new FakeRemote((t) => typical(t));
+    await e.start(remote);
+    await waitFor(() => e.getSnapshot().stage === 'done');
+    const s = e.getSnapshot();
+    const asked = questionsFor(2).filter((q) => q.id !== 'close');
+    expect(s.answers.map((a) => a.qid)).toEqual(asked.map((q) => q.id));
+    for (const a of s.answers) {
+      expect([a.qid, a.persisted]).toEqual([a.qid, true]);
+      // what the card shows IS what is in the database, and in her record
+      expect(dbMod.answersTable.get(`${e.sessionId}#${a.qid}`)?.value).toBe(a.value);
+      expect(draftOf()[a.qid].value).toBe(a.value);
+    }
+    const ifa = s.answers.find((a) => a.qid === 'ifa')!;
+    expect(ifa).toMatchObject({ status: 'saved', heard: TYPICAL.ifa, value: 'Yes, every day' });
+    expect(ifa.latencyMs).not.toBeNull();
+  });
+
+  it('Next is offered ONLY after an answer is saved; tapping it moves on at once', async () => {
+    const e = engineFor('kavitha', undefined, 60_000); // a window that would never end by itself
+    const confirmingWhileListening: boolean[] = [];
+    const remote = new FakeRemote((t) => {
+      confirmingWhileListening.push(e.getSnapshot().confirming);
+      return typical(t);
+    });
+    await e.start(remote);
+    await waitFor(() => e.getSnapshot().confirming);
+    expect(e.getSnapshot().saved).toMatchObject({ idx: 0, status: 'saved', persisted: true });
+    expect(remote.asked()).toHaveLength(1); // waiting on the ASHA, not asking Q2 yet
+    e.next();
+    await waitFor(() => remote.asked().length === 2);
+    expect(confirmingWhileListening.every((c) => !c)).toBe(true); // never while she is answering
+  });
+
+  it('a hard answer is saved as unclear, a silent one as no answer: the ASHA sees both, nothing is lost', async () => {
+    const e = engineFor();
+    const qWarn = qText('warning');
+    const remote = new FakeRemote((t, n) => (t === qWarn ? text('ಏನು') : n === 2 || n === 3 ? { kind: 'silence' } : typical(t)));
+    await e.start(remote);
+    await waitFor(() => e.getSnapshot().stage === 'done');
+    const by = (qid: string) => e.getSnapshot().answers.find((a) => a.qid === qid);
+    expect(by('warning')).toMatchObject({ status: 'unclear', heard: 'ಏನು', danger: true });
+    expect(by(questionsFor(2)[1].id)).toMatchObject({ status: 'no_answer', heard: null });
   });
 });

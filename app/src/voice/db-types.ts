@@ -27,6 +27,32 @@ export type SessionRow = {
   pdf_uri: string | null;
 };
 
+/**
+ * What a question's answer was SAVED as (one row per question per check-in,
+ * replaced when the answer changes). The engine moves on only after this row
+ * is written, so the "Saved" tick the ASHA sees means it is on the phone.
+ *   saved       understood and complete
+ *   unclear     heard, but not understood (or only partly): check in review
+ *   no_answer   nothing was said
+ *   skipped     she asked to skip it
+ *   prefilled   answered by an earlier answer
+ *   offline     her voice is kept; the words come when the speech service is back
+ */
+export type AnswerStatus = 'saved' | 'unclear' | 'no_answer' | 'skipped' | 'prefilled' | 'offline';
+
+export type AnswerRow = {
+  session_id: string;
+  qid: string;
+  idx: number;
+  value: string;
+  heard: string | null;
+  danger: number;
+  status: AnswerStatus;
+  /** End of her speech -> saved here (ms); null when there was no speech. */
+  latency_ms: number | null;
+  saved_at: number;
+};
+
 /** An owed answer across every check-in, with what the outbox needs to send it. */
 export type OutboxRow = TurnRow & { lang: string; mother_id: string };
 
@@ -44,6 +70,10 @@ export type VoiceDb = {
   /** Every owed answer that still has its audio, oldest first (the global outbox). */
   outboxAll(): Promise<OutboxRow[]>;
   turns(sessionId: string): Promise<TurnRow[]>;
+  /** Write (or replace) what a question's answer was saved as. */
+  saveAnswer(a: Omit<AnswerRow, 'saved_at'>): Promise<void>;
+  /** Every saved answer of a check-in, in question order. */
+  answers(sessionId: string): Promise<AnswerRow[]>;
   getDiagnostics(): Promise<Diagnostics>;
   logEvent(sessionId: string, kind: string, ms: number): Promise<void>;
 };

@@ -328,36 +328,87 @@ class GatewayHardening(unittest.TestCase):
         self.assertEqual(gw.client_id({"X-Forwarded-For": "2.2.2.2, 10.0.0.1"}, "127.0.0.1"), "2.2.2.2")
         self.assertEqual(gw.client_id({}, "127.0.0.1"), "127.0.0.1")
 
+    def _with_conn(self, conn):
+        """Run gw._request against a fake pooled connection."""
+        original = gw._conn
+        gw._conn = lambda host, timeout: (conn, False)
+        return original
+
     def test_provider_error_body_stays_on_the_server(self):
-        original = gw.urllib.request.urlopen
+        class Resp:
+            status, will_close = 401, True
 
-        def refuse(*a, **k):
-            raise urllib.error.HTTPError("https://api.example/stt", 401, "no", {}, io.BytesIO(b'{"error":"invalid key sk-LEAK-123 for account 42"}'))
+            def read(self):
+                return b'{"error":"invalid key sk-LEAK-123 for account 42"}'
 
-        gw.urllib.request.urlopen = refuse
+        class Conn:
+            def request(self, *a):
+                pass
+
+            def getresponse(self):
+                return Resp()
+
+            def close(self):
+                pass
+
+        original = self._with_conn(Conn())
         try:
             with self.assertRaises(gw.GatewayError) as ctx:
                 gw._request("https://api.example/stt", b"", {}, 1.0)
         finally:
-            gw.urllib.request.urlopen = original
+            gw._conn = original
         self.assertEqual(ctx.exception.status, 502)
         self.assertNotIn("LEAK", ctx.exception.message)
         self.assertNotIn("account", ctx.exception.message)
 
     def test_unreachable_provider_is_504_without_details(self):
-        original = gw.urllib.request.urlopen
+        class Conn:
+            def request(self, *a):
+                raise OSError("getaddrinfo failed for internal-host.corp")
 
-        def down(*a, **k):
-            raise urllib.error.URLError("getaddrinfo failed for internal-host.corp")
+            def close(self):
+                pass
 
-        gw.urllib.request.urlopen = down
+        original = self._with_conn(Conn())
         try:
             with self.assertRaises(gw.GatewayError) as ctx:
                 gw._request("https://x", b"", {}, 1.0)
         finally:
-            gw.urllib.request.urlopen = original
+            gw._conn = original
         self.assertEqual(ctx.exception.status, 504)
         self.assertNotIn("internal-host", ctx.exception.message)
+
+    def test_a_stale_kept_alive_connection_is_retried_once_on_a_fresh_one(self):
+        import http.client
+
+        class Resp:
+            status, will_close = 200, True
+
+            def read(self):
+                return b"ok"
+
+        class Stale:
+            def request(self, *a):
+                raise http.client.RemoteDisconnected("closed while idle")
+
+            def close(self):
+                pass
+
+        class Fresh(Stale):
+            def request(self, *a):
+                pass
+
+            def getresponse(self):
+                return Resp()
+
+        conns = [(Stale(), True), (Fresh(), False)]
+        original = gw._conn
+        gw._conn = lambda host, timeout: conns.pop(0)
+        try:
+            self.assertEqual(gw._request("https://x/stt", b"", {}, 1.0), b"ok")
+        finally:
+            gw._conn = original
+        self.assertEqual(conns, [])
 
 
 # ---- the dev front's pass-through -------------------------------------------------------

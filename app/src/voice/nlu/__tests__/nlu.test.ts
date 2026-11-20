@@ -289,10 +289,8 @@ describe('Intake: second and third visits', () => {
     expect(say(new Intake(3), 'ironCalcium', 'ಇಲ್ಲ').record.value).toBe('No (check)');
   });
 
-  it('birth plan: the place she chose; home is flagged; no help means arrange transport', () => {
-    expect(say(new Intake(3), 'deliveryPlace', 'ತಾಲೂಕು ಆಸ್ಪತ್ರೆಯಲ್ಲಿ').record.value).toBe('Yes, taluk hospital');
-    expect(say(new Intake(3), 'deliveryPlace', 'ಮನೆಯಲ್ಲಿ').record.value).toBe('At home (check: facility delivery advised)');
-    expect(say(new Intake(3), 'support', 'ಇಲ್ಲ').record.value).toBe('No (arrange transport)');
+  it('third visit: the 8 framework questions; birth plan and the warning question are not asked by voice', () => {
+    expect(questionsFor(3).map((q) => q.id)).toEqual(['newProblems', 'movement', 'movementLess', 'bleedLeak', 'tummySize', 'feverPain', 'breathing', 'ironCalcium', 'close']);
   });
 
   it('asked twice and still unclear: recorded as such; a danger question is flagged', () => {
@@ -364,7 +362,7 @@ describe('real Gnani transcripts (from the agent and WebSocket logs)', () => {
 
 describe('rural dialect (North Karnataka / Bidar, rural Hindi)', () => {
   it('recognizes rural vision terms: ಕಣ್ಣು ಕತ್ತಲೆ', () => {
-    const res = new Intake(3).answer('warning', 'ಕಣ್ಣು ಕತ್ತಲೆ ಆಗ್ತಿದೆ');
+    const res = new Intake(2).answer('warning', 'ಕಣ್ಣು ಕತ್ತಲೆ ಆಗ್ತಿದೆ');
     expect(res.complete).toBe(true);
     expect(res.record.danger).toBe(true);
     expect(res.record.signs).toContain('vision');

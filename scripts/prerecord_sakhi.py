@@ -1,4 +1,4 @@
-"""Prerecord every fixed line Sakhi says, in Kannada and Hindi, once.
+"""Prerecord every fixed line Sakhi says, in Kannada, Hindi and English, once.
 
     python scripts/prerecord_sakhi.py [--voice Kaveri] [--force]
 
@@ -9,7 +9,7 @@ waits. Recorded once, they ship inside the app and play instantly, offline,
 with zero TTS calls at run time.
 
 The texts are read from the app's own sources, never retyped here:
-  app/src/data/mockScreening.ts  the question bank (questionKn / questionHi)
+  app/src/data/mockScreening.ts  the question bank (en / questionKn / questionHi)
                                  and SAKHI_REPLIES (danger, urgent, done)
   app/src/i18n/strings.ts        vGreetingVoice, vReask, vReprompt,
                                  vAskName, vAskAge, vAskDiastolic (micro-prompts)
@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "app"
 OUT = APP / "assets" / "voice"
 GEN = APP / "src" / "voice" / "prerecorded.generated.ts"
-LANGS = ("kn", "hi")
+LANGS = ("kn", "hi", "en")
 
 
 def ts_unquote(s: str) -> str:
@@ -47,7 +47,7 @@ def ts_unquote(s: str) -> str:
 
 
 def string_block(src: str, lang: str) -> str:
-    start = src.index(f"const {lang}: Strings = {{")
+    start = src.index(f"const {lang} = {{" if lang == "en" else f"const {lang}: Strings = {{")
     end = src.index("\n};", start)
     return src[start:end]
 
@@ -85,13 +85,24 @@ def sign_followups(block: str) -> list[tuple[str, str]]:
                 continue
             seen.add(line)
             out.append((f"also_{'_'.join(rest)}", line))
+    # after a bare "yes": "Which one: bleeding or discharge?" (the question's whole set)
+    which = string_key(block, "vWhichSigns")
+    for signs in QUESTION_SIGNS.values():
+        words = joiner.join(string_key(block, "sg" + sg[0].upper() + sg[1:]) for sg in signs)
+        line = which.replace("{signs}", words)
+        if line not in seen:
+            seen.add(line)
+            out.append((f"which_{'_'.join(signs)}", line))
     return out
 
 
 def collect() -> dict[str, list[tuple[str, str]]]:
     screening = (APP / "src" / "data" / "mockScreening.ts").read_text(encoding="utf-8")
     strings = (APP / "src" / "i18n" / "strings.ts").read_text(encoding="utf-8")
-    questions = re.findall(r"\{ id: '([A-Za-z0-9]+)'.*?questionKn: '((?:[^'\\]|\\.)*)', questionHi: '((?:[^'\\]|\\.)*)'", screening)
+    # en is single-quoted, or double-quoted when it holds an apostrophe ("your baby's movements")
+    sq, dq = r"'((?:[^'\\]|\\.)*)'", r'"((?:[^"\\]|\\.)*)"'
+    pattern = r"\{ id: '([A-Za-z0-9]+)'.*?en: (?:" + sq + "|" + dq + r"), questionKn: " + sq + r", questionHi: " + sq
+    questions = [(q, en_s or en_d, kn, hi) for q, en_s, en_d, kn, hi in re.findall(pattern, screening)]
     if len(questions) < 30:
         raise SystemExit(f"expected the question bank in mockScreening.ts, found {len(questions)} questions")
     replies = {}
@@ -109,6 +120,8 @@ def collect() -> dict[str, list[tuple[str, str]]]:
             ("reprompt", string_key(block, "vReprompt")),
             ("ask_how_many", string_key(block, "vAskHowMany")),
             ("ask_date", string_key(block, "vAskDate")),
+            ("ask_which_ones", string_key(block, "vAskWhichOnes")),
+            ("ask_tell_more", string_key(block, "vAskTellMore")),
             ("waiting", string_key(block, "vWaiting")),
             ("away", string_key(block, "vAway")),
             ("ok", replies[lang]["ok"]),
@@ -116,7 +129,7 @@ def collect() -> dict[str, list[tuple[str, str]]]:
             ("urgent", replies[lang]["urgent"]),
             ("done", replies[lang]["done"]),
         ]
-        out += [(qid, ts_unquote(kn if lang == "kn" else hi)) for qid, kn, hi in questions]
+        out += [(qid, ts_unquote({"kn": kn, "hi": hi, "en": en}[lang])) for qid, en, kn, hi in questions]
         out += sign_followups(block)
         lines[lang] = out
     return lines
@@ -189,7 +202,7 @@ def main() -> None:
         f"// Voice: Gnani {args.voice} (female), 16 kHz mono. Re-run the script after changing a line.\n"
         "\n"
         "export type PrerecordedLine = { text: string; ms: number; asset: number };\n\n"
-        "export const PRERECORDED: Record<'kn' | 'hi', Record<string, PrerecordedLine>> = {\n" + ",\n".join(rows) + ",\n};\n",
+        "export const PRERECORDED: Record<'kn' | 'hi' | 'en', Record<string, PrerecordedLine>> = {\n" + ",\n".join(rows) + ",\n};\n",
         encoding="utf-8",
     )
     total = sum(e["bytes"] for l in manifest["lines"].values() for e in l.values())

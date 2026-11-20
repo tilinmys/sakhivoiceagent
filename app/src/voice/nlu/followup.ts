@@ -33,8 +33,14 @@ export function signsLine(lang: Lang, signs: Sign[]) {
   return format(s.vAlsoSigns, { signs: signs.map((sg) => s[SIGN_WORD[sg]]).join(s.vOr) });
 }
 
+/** "Which one: bleeding or unusual discharge?" (after a bare "yes" to a danger question). */
+export function whichLine(lang: Lang, signs: Sign[]) {
+  const s = STRINGS[lang];
+  return format(s.vWhichSigns, { signs: signs.map((sg) => s[SIGN_WORD[sg]]).join(s.vOr) });
+}
+
 export function followUpText(lang: Lang, f: FollowUp) {
-  return 'key' in f ? STRINGS[lang][f.key] : signsLine(lang, f.signs);
+  return 'key' in f ? STRINGS[lang][f.key] : 'which' in f ? whichLine(lang, f.which) : signsLine(lang, f.signs);
 }
 
 /** Every proper, non-empty subset of a question's signs (what can be left unanswered). */
@@ -46,8 +52,11 @@ function leftovers(signs: Sign[]): Sign[][] {
 
 /** All follow-up lines a check-in can say, in this language. */
 export function allFollowUps(lang: Lang): string[] {
-  const keys: StringKey[] = ['vAskHowMany', 'vAskDate'];
+  const keys: StringKey[] = ['vAskHowMany', 'vAskDate', 'vAskWhichOnes', 'vAskTellMore'];
   const lines = keys.map((k) => STRINGS[lang][k]);
-  for (const signs of Object.values(QUESTION_SIGNS)) for (const rest of leftovers(signs)) lines.push(signsLine(lang, rest));
+  for (const signs of Object.values(QUESTION_SIGNS)) {
+    for (const rest of leftovers(signs)) lines.push(signsLine(lang, rest));
+    lines.push(whichLine(lang, signs));
+  }
   return [...new Set(lines)];
 }

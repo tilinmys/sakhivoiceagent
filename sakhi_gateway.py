@@ -19,13 +19,12 @@ Providers (measured live from this repo, 2026-10-26):
   sarvam  (when SARVAM_API_KEY is set and SAKHI_APP_PROVIDER=sarvam)
           transcribe + translate in parallel, so "en" is filled.
 
-STT: ONLY the self-hosted open-source model (stt_service/, bodhan-ai/
-  indic-transcribe-flex on a GPU, port 8795, INDIC_STT_URL). Gnani / Sarvam
-  are NOT used for speech-to-text (only for Sakhi's voice, TTS). Kannada /
-  Hindi come back in native script with numbers as WORDS (the app parses
-  them); English in mixed mode. Reply: {text, en, ms, provider: "indic",
-  lang, lid_confidence}. Service down -> 502 / 504 (the app retries, then
-  keeps the answer in its offline outbox).
+STT: Gnani /stt/v3 behind an audio clean-up pipeline (sakhi_audio.py): the
+  app may send IMA-ADPCM (4x smaller) on weak networks; every answer is
+  high-passed, noise-reduced, levelled and trimmed, and an empty result for
+  a clip that holds speech gets one stronger second pass (see "STT" below).
+  Kannada / Hindi in native script with numbers as digits; English as is.
+  Reply: {text, en, ms, provider: "gnani", lang, passes, speech_ms, audio_ms}.
 """
 
 from __future__ import annotations
@@ -35,13 +34,16 @@ import collections
 import concurrent.futures
 import heapq
 import hmac
+import http.client
 import itertools
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -113,26 +115,110 @@ class _Lane:
             self._cv.notify_all()
 
 
-# ONE slot: the Gnani account allows a single active request ("Only 1
-# active request is allowed at a time", HTTP 429). A second lane or a hedged
-# duplicate request only earns 429s (tried 2026-11-01). Keep TTS off this
-# lane during a check-in instead: the app agent plays recorded lines.
-_gnani_lane = _Lane(int(os.getenv("GNANI_CONCURRENCY", "1")))
+# Gnani keys: GNANI_API_KEY, then GNANI_API_KEY_2 (failover). Each KEY has ONE
+# request slot ("Only 1 active request is allowed at a time", HTTP 429), and
+# the slots are independent (measured 2026-11-13: two calls at once on one key
+# -> 200 + 429; one on each key -> 200 + 200). So:
+#   * one lane (priority semaphore) per key
+#   * a request takes the first key whose lane is free; an early key is only
+#     waited on briefly (FIRST_WAIT_S) when another key is left
+#   * 429 / 5xx / timeout / 401-403 on a key -> the same request on the next
+#     key at once, and that key is benched for a while (COOLDOWN_S)
+#   * STT is hedged (_hedged): Gnani REST hangs ~5 s on ~1 call in 20 and the
+#     hung call holds its key's slot; past HEDGE_S the same request goes to
+#     the other key and the first answer wins
+_lanes: dict[int, _Lane] = {}
+_bench: dict[int, float] = {}
+_keys_lock = threading.Lock()
+FIRST_WAIT_S = {"stt": 0.15, "now": 0.4, "next": 2.0, "warm": 5.0}
+COOLDOWN_S = {"auth": 300.0, "busy": 5.0, "fail": 20.0}
+HEDGE_S = float(os.getenv("SAKHI_STT_HEDGE_S", "1.0"))
+_HEDGE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="gnani-hedge")
+
+
+def gnani_keys() -> list[str]:
+    """The configured Gnani keys, in failover order (read live: tests and .env reloads)."""
+    return [k for k in (os.getenv("GNANI_API_KEY", "").strip(), os.getenv("GNANI_API_KEY_2", "").strip()) if k]
+
+
+def _lane(i: int) -> _Lane:
+    with _keys_lock:
+        if i not in _lanes:
+            _lanes[i] = _Lane(int(os.getenv("GNANI_CONCURRENCY", "1")))
+        return _lanes[i]
+
+
+def _key_order(n: int) -> list[int]:
+    """Keys in use order: healthy ones first (in .env order), benched ones last."""
+    now = time.monotonic()
+    return sorted(range(n), key=lambda i: (_bench.get(i, 0.0) > now, i))
+
+
+def _fails_over(exc: GatewayError) -> str | None:
+    if exc.status in (401, 402, 403) or exc.status == 502 and "(40" in exc.message:
+        return "auth"
+    if exc.status == 429 or (exc.status == 503 and "busy" in exc.message):
+        return "busy"
+    if exc.status >= 500:
+        return "fail"
+    return None
 
 
 def _gnani_call(kind: str, run):
-    """Run one Gnani request in the lane; retry a 429 that slipped through."""
-    _gnani_lane.acquire(PRIORITY[kind], LANE_WAIT_S[kind])
+    """Run one Gnani request, `run(key)`, on the first free healthy key; fail over on errors."""
+    keys = gnani_keys()
+    if not keys:
+        raise GatewayError(503, "Speech is not configured on the server (set GNANI_API_KEY).")
+    order = _key_order(len(keys))
+    last: GatewayError | None = None
+    for n, i in enumerate(order):
+        final = n == len(order) - 1
+        try:
+            _lane(i).acquire(PRIORITY[kind], LANE_WAIT_S[kind] if final else FIRST_WAIT_S[kind])
+        except GatewayError as exc:  # this key's slot is busy: the next key
+            last = exc
+            continue
+        try:
+            # with one key left, a 429 that slipped through is retried on it
+            for delay in (*(RETRY_429_S if final else ()), None):
+                try:
+                    return run(keys[i])
+                except GatewayError as exc:
+                    if exc.status != 429 or delay is None:
+                        raise
+                    time.sleep(delay)
+        except GatewayError as exc:
+            why = _fails_over(exc)
+            if why is None or final:
+                raise
+            _bench[i] = time.monotonic() + COOLDOWN_S[why]
+            log.warning("gnani key %d %s (%s): failing over to key %d", i + 1, why, exc.status, order[n + 1] + 1)
+            last = exc
+        finally:
+            _lane(i).release()
+    raise last or GatewayError(503, "Voice provider busy, try again.")
+
+
+def _hedged(kind: str, run):
+    """_gnani_call, and past HEDGE_S without an answer, the same request again (it lands on the other key); first answer wins."""
+    if len(gnani_keys()) < 2:
+        return _gnani_call(kind, run)
+    first = _HEDGE_POOL.submit(_gnani_call, kind, run)
     try:
-        for delay in (*RETRY_429_S, None):
-            try:
-                return run()
-            except GatewayError as exc:
-                if exc.status != 429 or delay is None:
-                    raise
-                time.sleep(delay)
-    finally:
-        _gnani_lane.release()
+        return first.result(timeout=HEDGE_S)
+    except concurrent.futures.TimeoutError:
+        pass
+    log.info("gnani: no answer in %.1f s, hedging on the other key", HEDGE_S)
+    second = _HEDGE_POOL.submit(_gnani_call, kind, run)
+    pending = {first, second}
+    err: BaseException | None = None
+    while pending:
+        done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        for f in done:
+            if f.exception() is None:
+                return f.result()
+            err = f.exception()
+    raise err  # both failed
 
 
 def provider() -> str | None:
@@ -228,25 +314,105 @@ def lang_code(lang: str) -> str:
 
 def health() -> dict:
     p = provider()
-    return {"stt": bool(indic_url()), "tts": bool(p), "provider": p, "translate": False, "stt_provider": "indic"}
+    stt_on = bool(gnani_keys())
+    # The app asks health when a check-in starts and when she starts speaking
+    # (gateway.warm): open the provider connection now, so her answer's STT
+    # does not pay the TLS handshake (~100-300 ms) on top.
+    if stt_on:
+        _prewarm(GNANI_BASE)
+    return {"stt": stt_on, "tts": bool(p), "provider": p, "translate": False, "stt_provider": "gnani"}
+
+
+# Kept-alive HTTPS connections to the providers, per host. A fresh connection
+# costs a TCP + TLS handshake on EVERY call (measured to Gnani: 276 ms median
+# per STT call fresh, 181 ms on a kept-alive connection, ~95 ms saved per
+# answer). Pop / push under a lock (O(1)); a connection that went stale while
+# idle fails at once and the call is retried ONCE on a fresh one.
+_POOL: dict[str, list[http.client.HTTPSConnection]] = collections.defaultdict(list)
+_POOL_LOCK = threading.Lock()
+_POOL_MAX = 4
+_STALE = (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+def _conn(host: str, timeout: float) -> tuple[http.client.HTTPSConnection, bool]:
+    with _POOL_LOCK:
+        if _POOL[host]:
+            c = _POOL[host].pop()
+            c.timeout = timeout
+            if c.sock is not None:
+                c.sock.settimeout(timeout)
+            return c, True
+    return http.client.HTTPSConnection(host, timeout=timeout, context=ssl.create_default_context()), False
+
+
+_WARMING: set[str] = set()
+
+
+def _prewarm(base: str) -> None:
+    """Open one kept-alive connection to `base` in the background, if none is idle (never blocks)."""
+    host = urllib.parse.urlsplit(base).netloc
+    with _POOL_LOCK:
+        if _POOL[host] or host in _WARMING:
+            return
+        _WARMING.add(host)
+
+    def run() -> None:
+        try:
+            c = http.client.HTTPSConnection(host, timeout=5, context=ssl.create_default_context())
+            c.connect()
+            _release(host, c)
+        except OSError:
+            pass
+        finally:
+            with _POOL_LOCK:
+                _WARMING.discard(host)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _release(host: str, c: http.client.HTTPSConnection) -> None:
+    with _POOL_LOCK:
+        if len(_POOL[host]) < _POOL_MAX:
+            _POOL[host].append(c)
+            return
+    c.close()
 
 
 def _request(url: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
-    req = urllib.request.Request(url, data=body, method="POST", headers={"User-Agent": USER_AGENT, **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        # The provider's own error text (account, quota, request ids) stays
-        # in the server log; the app only learns the kind of failure.
-        detail = exc.read()[:300].decode("utf-8", "replace")
-        log.warning("provider HTTP %s: %s", exc.code, detail)
-        status = exc.code if exc.code == 429 or exc.code >= 500 else 502 if exc.code in (401, 402, 403) else 400
-        message = "Voice provider busy, try again." if exc.code == 429 else f"Voice provider error ({exc.code})."
-        raise GatewayError(status, message) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        log.warning("provider unreachable: %s", exc)
-        raise GatewayError(504, "Voice provider unreachable.") from exc
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    hdrs = {"User-Agent": USER_AGENT, "Connection": "keep-alive", **headers}
+    deadline = time.monotonic() + timeout
+    for attempt in (0, 1):
+        c, reused = _conn(parts.netloc, max(0.5, deadline - time.monotonic()))
+        try:
+            c.request("POST", path, body, hdrs)
+            resp = c.getresponse()
+            data = resp.read()
+        except _STALE as exc:
+            c.close()
+            if reused and attempt == 0:  # idle connection closed by the server: one fresh try
+                continue
+            log.warning("provider unreachable: %s", exc)
+            raise GatewayError(504, "Voice provider unreachable.") from exc
+        except (OSError, http.client.HTTPException) as exc:  # timeout, DNS, refused, TLS
+            c.close()
+            log.warning("provider unreachable: %s", exc)
+            raise GatewayError(504, "Voice provider unreachable.") from exc
+        if resp.will_close:
+            c.close()
+        else:
+            _release(parts.netloc, c)
+        if resp.status >= 400:
+            # The provider's own error text (account, quota, request ids) stays
+            # in the server log; the app only learns the kind of failure.
+            log.warning("provider HTTP %s: %s", resp.status, data[:300].decode("utf-8", "replace"))
+            code = resp.status
+            status = code if code == 429 or code >= 500 else 502 if code in (401, 402, 403) else 400
+            message = "Voice provider busy, try again." if code == 429 else f"Voice provider error ({code})."
+            raise GatewayError(status, message)
+        return data
+    raise GatewayError(504, "Voice provider unreachable.")
 
 
 def _multipart(fields: dict[str, str], file_field: str, file_bytes: bytes) -> tuple[bytes, str]:
@@ -265,60 +431,99 @@ def _multipart(fields: dict[str, str], file_field: str, file_bytes: bytes) -> tu
 
 # --- STT ----------------------------------------------------------------------
 #
-# Speech-to-text is ONLY the self-hosted open-source model (stt_service/,
-# bodhan-ai/indic-transcribe-flex, INDIC_STT_URL). Gnani / Sarvam are not
-# used for STT at all (they remain Sakhi's voice: TTS). When the service is
-# down or slow the app gets a retryable error (502 / 504) and keeps the
-# answer in its offline outbox until the service is back: no answer is
-# silently sent to another provider.
+# Speech-to-text is Gnani /stt/v3 (format=transcribe: numbers as digits, its
+# fastest mode, ~220-440 ms). Every answer goes through ONE pipeline:
+#
+#   decode     the app's WAV: PCM16, or IMA-ADPCM (4x smaller, sent on weak networks)
+#   enhance    sakhi_audio.enhance: 80 Hz high-pass, Wiener noise reduction from the
+#              clip's own quiet frames, speech-gated level (a soft voice up to +24 dB,
+#              peak-limited), trim of dead air. Gnani hears a clean, normal-level voice.
+#   pass 1     Gnani, in the answer's language (kn-IN / hi-IN / en-IN), on the STT lane
+#              (priority over TTS: the account allows one request at a time)
+#   pass 2     ONLY if pass 1 came back empty although the clip holds >= 400 ms of
+#              speech: once more with the stronger clean-up (120 Hz, -16 dB floor,
+#              +30 dB). This is the "she spoke but nothing was caught" case that
+#              used to make her repeat herself; it costs one extra call, only then.
+#
+# Reply: {text, en, ms, provider: "gnani", lang, passes, speech_ms, audio_ms}.
 
-INDIC_STT_TIMEOUT_S = float(os.getenv("INDIC_STT_TIMEOUT", "6"))
+STT_MIN_SPEECH_MS = 400
 
 
-def indic_url() -> str:
-    """The self-hosted Indic STT service (stt_service/)."""
-    return os.getenv("INDIC_STT_URL", "").strip().rstrip("/")
+# Maternal-health vocabulary for Gnani's word boosting (Prisma v2.5 bias_list:
+# single words, letters only, up to 100). Bidar Kannada, Deccani Hindi and the
+# code-switched English an ASHA hears. OFF by default (SAKHI_STT_BIAS_SCORE
+# = 0): A/B on the 42-answer test set at score 1.0 gave the SAME error rate
+# in kn / hi / en (0.164 / 0.134 / 0.044) and turned one "test" into
+# "chest". Set SAKHI_STT_BIAS_SCORE to 0.5 / 1.0 / 1.5 / 2.0 to try it in the
+# field. The app's NLU lexicon (nlu/lexicon.ts) already matches these terms
+# with one-edit fuzzy matching after recognition.
+STT_BIAS = {
+    "kn-IN": ["ಹೌದು", "ಇಲ್ಲ", "ನೋವು", "ತಲೆನೋವು", "ಹೊಟ್ಟೆನೋವು", "ರಕ್ತದೊತ್ತಡ", "ಬಿಪಿ", "ರಕ್ತಸ್ರಾವ", "ಜ್ವರ", "ಊತ", "ವಾಂತಿ", "ಮಾತ್ರೆ", "ಕಬ್ಬಿಣ", "ಕ್ಯಾಲ್ಸಿಯಂ", "ಸ್ಕ್ಯಾನ್", "ಹಿಮೋಗ್ಲೋಬಿನ್", "ಮಗು", "ಚಲನೆ", "ಆಸ್ಪತ್ರೆ", "ಸಕ್ಕರೆ", "ಥೈರಾಯ್ಡ್"],
+    "hi-IN": ["हाँ", "नहीं", "दर्द", "सिरदर्द", "पेटदर्द", "सूजन", "बुखार", "खून", "ब्लीडिंग", "उल्टी", "गोली", "आयरन", "कैल्शियम", "स्कैन", "बीपी", "हीमोग्लोबिन", "बच्चा", "हलचल", "अस्पताल", "शुगर", "थायराइड"],
+    "en-IN": ["BP", "haemoglobin", "hemoglobin", "iron", "tablets", "calcium", "scan", "swelling", "headache", "bleeding", "fever", "vomiting", "howdu", "illa", "haan", "nahi", "thyroid", "sugar", "hospital"],
+}
 
 
-def _indic_stt(wav: bytes, lang: str) -> dict:
-    """One answer through the Indic STT service: {text, en, ms, provider, lang, lid_confidence}."""
-    started = time.perf_counter()
-    raw = _request(f"{indic_url()}/api/stt/raw?lang={lang}", wav, {"Content-Type": "audio/wav"}, INDIC_STT_TIMEOUT_S)
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        raise GatewayError(502, "Speech service returned an invalid reply.") from exc
-    text = (data.get("text") or "").strip()
-    return {
-        "text": text,
-        "en": (data.get("en") or "").strip() or (text if lang == "en" else ""),
-        "ms": round((time.perf_counter() - started) * 1000),
-        "provider": "indic",
-        "lang": data.get("lang") or lang,
-        "lid_confidence": data.get("lid_confidence"),
-    }
+def _stt_bias_fields(code: str) -> dict[str, str]:
+    score = os.getenv("SAKHI_STT_BIAS_SCORE", "0").strip()
+    if score not in ("0.5", "1.0", "1.5", "2.0") or code not in STT_BIAS:  # Gnani's allowed values; anything else = off
+        return {}
+    return {"bias_list": json.dumps(STT_BIAS[code], ensure_ascii=False), "bias_score": score}
+
+
+def _gnani_stt(wav: bytes, code: str, key: str | None = None) -> str:
+    # format=transcribe: numbers come back as digits (148 ಬೈ 96), and it is
+    # the faster mode (~220-250 ms vs ~280-320 ms verbatim, measured).
+    body, ctype = _multipart({"language_code": code, "format": "transcribe", **_stt_bias_fields(code)}, "audio_file", wav)
+    data = json.loads(_request(f"{GNANI_BASE}/stt/v3", body, {"X-API-Key-ID": key or os.environ["GNANI_API_KEY"], "Content-Type": ctype}, STT_TIMEOUT_S))
+    return (data.get("transcript") or "").strip()
 
 
 def stt(wav: bytes, lang: str) -> dict:
-    """One answer -> transcript, by the open-source Indic model only."""
+    """One answer -> transcript (Gnani), through the clean-up pipeline above."""
+    import sakhi_audio  # numpy: imported on first use, so health / TTS never pay for it
+
     if not wav or len(wav) < 44 or wav[:4] != b"RIFF":
         raise GatewayError(400, "Body must be a WAV file.")
     if len(wav) > MAX_AUDIO_BYTES:
         raise GatewayError(413, "Answer too long (max 25 s).")
-    lang_code(lang)  # kn / hi / en only
-    if not indic_url():
-        raise GatewayError(503, "Speech-to-text is not configured on the server (set INDIC_STT_URL).")
+    code = lang_code(lang)
+    if not gnani_keys():
+        raise GatewayError(503, "Speech-to-text is not configured on the server (set GNANI_API_KEY).")
+    started = time.perf_counter()
     try:
-        return _indic_stt(wav, lang.strip().lower())
+        pcm = sakhi_audio.decode(wav)
+    except ValueError as exc:
+        raise GatewayError(400, f"Unreadable audio: {exc}.") from exc
+    speech = sakhi_audio.speech_ms(pcm)
+    clean = sakhi_audio.wav(sakhi_audio.enhance(pcm))
+    try:
+        text = _hedged("stt", lambda key: _gnani_stt(clean, code, key))
+        passes = 1
+        if not text and speech >= STT_MIN_SPEECH_MS:
+            strong = sakhi_audio.wav(sakhi_audio.enhance(pcm, strength=2.0))
+            text = _hedged("stt", lambda key: _gnani_stt(strong, code, key))
+            passes = 2
     except OSError as exc:  # connection reset mid-reply
-        log.warning("indic stt failed: %s", exc)
+        log.warning("gnani stt failed: %s", exc)
         raise GatewayError(504, "Speech service unreachable.") from exc
+    return {
+        "text": text,
+        "en": text if code == "en-IN" else "",
+        "ms": round((time.perf_counter() - started) * 1000),
+        "provider": "gnani",
+        "lang": lang.strip().lower(),
+        "passes": passes,
+        "speech_ms": speech,
+        "audio_ms": round(len(pcm) / 16),
+    }
 
 
 # --- TTS ----------------------------------------------------------------------
 
 
-def _gnani_tts(text: str, code: str) -> bytes:
+def _gnani_tts(text: str, code: str, key: str | None = None) -> bytes:
     payload = {
         "text": text,
         "voice": GNANI_VOICE,
@@ -329,7 +534,7 @@ def _gnani_tts(text: str, code: str) -> bytes:
     return _request(
         f"{GNANI_BASE}/api/v1/tts/inference",
         json.dumps(payload).encode("utf-8"),
-        {"X-API-Key-ID": os.environ["GNANI_API_KEY"], "Content-Type": "application/json"},
+        {"X-API-Key-ID": key or os.environ["GNANI_API_KEY"], "Content-Type": "application/json"},
         TTS_TIMEOUT_S,
     )
 
@@ -383,7 +588,7 @@ def tts(text: str, lang: str, priority: str = "now") -> bytes:
         if hit is not None:
             _tts_cache.move_to_end(key)
             return hit
-    audio = _gnani_call(kind, lambda: _gnani_tts(text, code)) if p == "gnani" else _sarvam_tts(text, code)
+    audio = _gnani_call(kind, lambda key: _gnani_tts(text, code, key)) if p == "gnani" else _sarvam_tts(text, code)
     audio = fix_wav_header(audio)
     if audio[:4] != b"RIFF":
         raise GatewayError(502, "Provider returned no WAV audio.")

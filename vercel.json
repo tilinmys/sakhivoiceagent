@@ -9,7 +9,7 @@
   ],
   "functions": {
     "api/index.py": {
-      "includeFiles": "{voice_catalog.py,vercel_common.py,sakhi_gateway.py,sakhi_live/**}"
+      "includeFiles": "{voice_catalog.py,vercel_common.py,sakhi_gateway.py,sakhi_audio.py,sakhi_live/**}"
     }
   }
 }

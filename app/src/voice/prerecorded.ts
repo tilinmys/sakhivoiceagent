@@ -3,9 +3,10 @@ import type { Lang } from '@/i18n/strings';
 import { PRERECORDED, type PrerecordedLine } from './prerecorded.generated';
 
 // Sakhi's fixed lines, recorded once in her own voice (Gnani, female) and
-// shipped inside the app (scripts/prerecord_sakhi.py): the greeting, the 24
-// questions, the re-ask, "please say it again", the danger warning and the
-// closing. They play instantly, offline, with no TTS request.
+// shipped inside the app (scripts/prerecord_sakhi.py), in Kannada, Hindi and
+// English: the greeting, every question, the re-ask, "please say it again",
+// the follow-ups, the danger warning and the closing. They play instantly,
+// offline, with no TTS request. Lookup is one Map get (O(1) per line).
 //
 // Looked up by the EXACT text on screen: a line whose wording changed no
 // longer matches its old recording and simply falls back to live TTS until
@@ -16,7 +17,7 @@ const squash = (t: string) => t.normalize('NFC').replace(/\s+/g, ' ').trim();
 const BY_TEXT: Partial<Record<Lang, Map<string, PrerecordedLine>>> = {};
 
 function table(lang: Lang) {
-  if (lang !== 'kn' && lang !== 'hi') return null;
+  if (!(lang in PRERECORDED)) return null; // every Lang today; kept for a new language without recordings
   let m = BY_TEXT[lang];
   if (!m) {
     m = new Map(Object.values(PRERECORDED[lang]).map((l) => [squash(l.text), l]));

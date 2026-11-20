@@ -85,8 +85,10 @@ export type Slots = {
   reported: Map<string, Sign[]>;
   /** Questions answered "don't know". */
   unknown: Set<string>;
-  /** A danger question answered "yes" with no sign named. */
+  /** A question answered with a bare "yes" (nothing named): it gets ONE clarifying follow-up. */
   vagueYes: Set<string>;
+  /** Still nothing named after that follow-up: recorded as said (flagged for the ASHA / doctor). */
+  stillVague: Set<string>;
 };
 type Adherence = 'daily' | 'irregular' | 'no';
 
@@ -113,7 +115,7 @@ export type Expect = 'count' | 'date';
  * it: a fixed line (`key`), or the danger signs she has not answered yet
  * (voice/nlu/followup.ts words them in her language).
  */
-export type FollowUp = { key: StringKey; expect: Expect } | { signs: Sign[] };
+export type FollowUp = { key: StringKey; expect?: Expect } | { signs: Sign[] } | { which: Sign[] };
 
 type Spec = {
   /** Danger questions are never skipped. */
@@ -130,6 +132,9 @@ type Spec = {
   notApplicable?(s: Slots): boolean;
   record(s: Slots, weeks?: number): AnswerRecord;
 };
+
+/** "ago" after a number of months, for the last period (kn / hi / en). */
+const LMP_AGO = /(ಹಿಂದೆ|ಹಿಂದ|ಮುಂಚೆ|पहले|पेहले|ago|back|before)/;
 
 const set = <K extends keyof Slots>(c: Ctx, key: K, v: NonNullable<Slots[K]> extends Slot<infer T> ? T : never) => {
   const cur = c.s[key] as Slot<unknown> | undefined;
@@ -174,8 +179,16 @@ function fillSigns(c: Ctx, signs: Sign[], generic?: { concept: Concept; sign: Si
   // ("ಇಲ್ಲ, ..."). "ತಲೆನೋವು ಇಲ್ಲ" (no headache) denies the headache only.
   const plainNo = c.f.global === 'no' && (!named.size || c.f.seen.has('NOTHING') || LEADING_NO.test(c.f.text));
   if (plainNo) signs.filter((sg) => !named.has(sg) && !answeredHere(c.s, c.q, sg)).forEach((sg) => setSign(c, sg, false));
-  else if (c.f.global === 'yes' && !named.size) c.s.vagueYes.add(c.q);
+  else if (c.f.global === 'yes' && !named.size) vague(c, c.q);
   else if (c.f.global === 'unknown' && !named.size) c.s.unknown.add(c.q);
+  // the clarifying turn said something, but no sign: recorded as a vague yes (flagged)
+  else if (!named.size && c.s.vagueYes.has(c.q) && c.f.raw.trim()) c.s.stillVague.add(c.q);
+}
+
+/** A bare "yes": the first time it is clarified (one follow-up), the second time it stands. */
+function vague(c: Ctx, q: string) {
+  if (c.s.vagueYes.has(q)) c.s.stillVague.add(q);
+  c.s.vagueYes.add(q);
 }
 
 function setSign(c: Ctx, sign: Sign, present: boolean) {
@@ -196,10 +209,14 @@ const answeredHere = (s: Slots, q: string, sg: Sign) => s.signs[sg]?.q === q && 
  * only denied some: "no headache" says nothing about vision or swelling.
  */
 const signsAnswered = (s: Slots, q: string, signs: Sign[]) =>
-  s.unknown.has(q) || s.vagueYes.has(q) || signs.some((sg) => answeredHere(s, q, sg) && s.signs[sg]?.v === true) || signs.every((sg) => answeredHere(s, q, sg));
-/** Some signs denied, the rest not answered: ask the rest (and only the rest). */
+  s.unknown.has(q) || s.stillVague.has(q) || signs.some((sg) => answeredHere(s, q, sg) && s.signs[sg]?.v === true) || signs.every((sg) => answeredHere(s, q, sg));
+/**
+ * A bare "yes" (no sign named): "Which one: bleeding or discharge?", once.
+ * Some signs denied, the rest not answered: ask the rest (and only the rest).
+ */
 function signsFollow(s: Slots, q: string, signs: Sign[]): FollowUp | null {
   if (signsAnswered(s, q, signs)) return null;
+  if (s.vagueYes.has(q)) return { which: signs.filter((sg) => !answeredHere(s, q, sg)) };
   const rest = signs.filter((sg) => !answeredHere(s, q, sg));
   return rest.length < signs.length ? { signs: rest } : null;
 }
@@ -211,7 +228,8 @@ function signRecord(s: Slots, q: string, signs: Sign[]): AnswerRecord {
   if (present.length) return { value: present.map((sg) => SIGN_LABEL[sg] + (WATCH_SIGNS.has(sg) ? ' (check)' : '')).join(', '), danger: alarming(present), signs: present };
   const unanswered = s.unknown.has(q) || s.vagueYes.has(q) ? [] : signs.filter((sg) => !answeredHere(s, q, sg));
   const rest = unanswered.length ? ` · Not answered: ${unanswered.map((sg) => SIGN_LABEL[sg]).join(', ')} (check)` : '';
-  if (s.vagueYes.has(q)) return { value: 'Yes (sign not named: check)', danger: true };
+  // (a "yes" clarified as "none of these" falls through to "No" below)
+  if (s.vagueYes.has(q) && !signs.every((sg) => answeredHere(s, q, sg))) return { value: 'Yes (sign not named: check)', danger: true };
   if (s.unknown.has(q)) return { value: 'Not known (check)', danger: true };
   if (unanswered.length) {
     const denied = signs.filter((sg) => answeredHere(s, q, sg));
@@ -276,7 +294,11 @@ function adherenceSpec(key: 'ifa' | 'calcium' | 'ironCalcium', concepts: Concept
   };
 }
 /** Named items of a list question ("which conditions?"), or none, or "yes" with none named. */
-function listSpec(key: 'losses' | 'pastProblems' | 'conditions' | 'longIllness' | 'tobacco', items: [Concept, string][], opts: { history?: boolean; notApplicable?: (s: Slots) => boolean; extra?: (c: Ctx) => string[] } = {}): Spec {
+function listSpec(
+  key: 'losses' | 'pastProblems' | 'conditions' | 'longIllness' | 'tobacco',
+  items: [Concept, string][],
+  opts: { history?: boolean; notApplicable?: (s: Slots) => boolean; notApplicableValue?: (s: Slots) => string; extra?: (c: Ctx) => string[] } = {},
+): Spec {
   return {
     danger: false,
     history: opts.history,
@@ -286,16 +308,26 @@ function listSpec(key: 'losses' | 'pastProblems' | 'conditions' | 'longIllness' 
       if (c.current) found.push(...(opts.extra?.(c) ?? []));
       if (found.length && (c.current || key === 'tobacco')) set(c, key, [...new Set(found)]);
       else if (c.current && (plainNoOf(c) || items.some(([k]) => pol(c, k) === -1))) set(c, key, []);
-      else if (c.current && c.f.global === 'yes') set(c, key, ['Yes (not named: check)']);
       else if (c.current && c.f.global === 'unknown') c.s.unknown.add(key);
+      // after "Which ones?": her words as said (nothing in the list was named)
+      else if (c.current && c.s.vagueYes.has(key) && c.f.raw.trim()) set(c, key, [saidAs(c)]);
+      else if (c.current && c.f.global === 'yes') c.s.vagueYes.add(key); // a bare "yes": "Which ones?"
     },
     done: (s) => !!s[key] || s.unknown.has(key),
+    follow: (s) => (!s[key] && s.vagueYes.has(key) ? { key: 'vAskWhichOnes' } : null),
     record: (s) => {
       const v = (s[key] as Slot<string[]> | undefined)?.v;
+      if (!v && opts.notApplicable?.(s) && opts.notApplicableValue) return { value: opts.notApplicableValue(s), danger: false };
       return { value: v?.length ? v.join(', ') : v ? 'No' : s.unknown.has(key) ? 'Not known' : 'Not clear', danger: false };
     },
   };
 }
+const IRON_WORD = /ಕಬ್ಬಿಣ|ಐರನ್|आयरन|आइरन|लोहे|iron|ifa/;
+/** Her own words, for a "yes" that named nothing the app knows: kept for the ASHA to read. */
+const saidAs = (c: Ctx) => {
+  const words = c.f.raw.trim();
+  return c.f.global === 'yes' && !c.f.rest.length ? 'Yes (not named: check)' : `Yes: "${words}" (check)`;
+};
 /** An open question ("anything worrying you?"): her own words, or "No". */
 function openSpec(key: 'concerns' | 'newProblems' | 'tummySize'): Spec {
   return {
@@ -305,15 +337,32 @@ function openSpec(key: 'concerns' | 'newProblems' | 'tummySize'): Spec {
       if (plainNoOf(c) && !c.f.said.size) set(c, key, '');
       else if (plainNoOf(c) && [...c.f.said.values()].every((p) => p === -1)) set(c, key, '');
       else if (c.f.global === 'unknown') c.s.unknown.add(key);
+      // "ಇದೆ ಇದೆ" (there is) and nothing else: ask what it is, once (field log 2026-11-17)
+      else if (bareYes(c) && !c.s.vagueYes.has(key)) c.s.vagueYes.add(key);
       else if (c.f.raw.trim()) set(c, key, c.f.raw.trim());
     },
     done: (s) => !!s[key] || s.unknown.has(key),
+    follow: (s) => (!s[key] && s.vagueYes.has(key) ? { key: 'vAskTellMore' } : null),
     record: (s) => {
       const v = s[key]?.v;
       return { value: v ? `Reported: "${v}" (check)` : v === '' ? 'No' : s.unknown.has(key) ? 'Not sure' : 'Not clear', danger: false };
     },
   };
 }
+
+/**
+ * Only "yes" words, nothing else ("ಇದೆ ಇದೆ ಇದೆ", "ಹೌದು", "हाँ जी", "yes"):
+ * EVERY word must be a plain affirmation. "ಹೌದು ಬೆಳೆಯುತ್ತಿದೆ" (yes, it is
+ * growing) says something, and is kept as said.
+ */
+const BARE_YES = new Set([
+  'ಹೌದು', 'ಹೌದ', 'ಹೌದೌದು', 'ಇದೆ', 'ಇದೆರೀ', 'ಇದ್ದೆ', 'ಹಾಂ', 'ಹೂಂ', 'ಹುಂ', 'ಹಾ', 'ಆಗಿದೆ', 'ಆಗಿತ್ತು', 'ಆಯ್ತು', 'ಆಗ್ತಿದೆ', 'ಹಾಗಿದೆ', 'ಅದೆ', 'ಐತಿ', 'ಐತೆ', 'ರೀ', 'ಅಮ್ಮ',
+  'हाँ', 'हां', 'हा', 'जी', 'है', 'हैं', 'हुआ', 'हुई', 'था', 'थी', 'yes', 'yeah', 'ya', 'haan', 'han', 'ji', 'there', 'is', 'it', 'happened', 'howdu', 'ide',
+]);
+const bareYes = (c: Ctx) => {
+  const words = c.f.text.split(' ').filter(Boolean);
+  return c.f.global === 'yes' && words.length > 0 && words.every((w) => BARE_YES.has(w));
+};
 
 const ORD = ['', '1st', '2nd', '3rd', '4th', '5th'];
 /** Words around a name that are not the name ("my name is", "her age"). */
@@ -396,6 +445,9 @@ export const SPECS: Record<string, Spec> = {
       if (months !== undefined) set(c, 'gaMonths', months);
       if (!c.current) return;
       if (c.f.date) set(c, 'lmp', c.f.date);
+      // "3 months ago" (Gnani: "3 ತಿಂಗಳ ಹಿಂದೆ ಆಗಿತ್ತು", "3 महीने पहले") is an
+      // answer, approximate: kept as said, never turned into a date.
+      else if (months !== undefined && LMP_AGO.test(c.f.text)) set(c, 'lmp', `about ${months} months ago`);
       else if (c.f.global === 'unknown' || c.f.global === 'no') set(c, 'lmp', 'unknown');
       else if (c.f.global === 'yes') c.s.vagueYes.add('lmp');
     },
@@ -453,15 +505,30 @@ export const SPECS: Record<string, Spec> = {
         ? { value: 'None: first pregnancy', danger: false }
         : { value: s.deliveries ? (s.deliveries.v === 0 ? 'No previous deliveries' : `${s.deliveries.v} previous deliver${s.deliveries.v === 1 ? 'y' : 'ies'}`) : 'Not known', danger: false },
   },
-  losses: listSpec('losses', [['MISCARRIAGE', 'Miscarriage'], ['ABORTION', 'Abortion'], ['STILLBIRTH', 'Stillbirth']], { history: true, notApplicable: firstPreg }),
+  // Skipped for a first pregnancy, and RECORDED as such (field log: they read "Not clear").
+  losses: listSpec('losses', [['MISCARRIAGE', 'Miscarriage'], ['ABORTION', 'Abortion'], ['STILLBIRTH', 'Stillbirth']], {
+    history: true,
+    notApplicable: firstPreg,
+    notApplicableValue: () => 'None: first pregnancy',
+  }),
   pastProblems: listSpec('pastProblems', [['CSECTION', 'C-section'], ['BLEEDING', 'Heavy bleeding'], ['FITS', 'Fits'], ['HTN', 'High BP'], ['DIABETES', 'Sugar'], ['STILLBIRTH', 'Stillbirth']], {
     history: true,
     notApplicable: firstPreg,
+    notApplicableValue: () => 'None: first pregnancy',
   }),
-  csection: yesNoSpec('csection', ['CSECTION'], 'Yes, C-section before (check)', 'No', {
-    history: true,
-    notApplicable: (s) => firstPreg(s) || s.deliveries?.v === 0 || (s.pastProblems?.v.includes('C-section') ?? false),
-  }),
+  csection: {
+    ...yesNoSpec('csection', ['CSECTION'], 'Yes, C-section before (check)', 'No', {
+      history: true,
+      notApplicable: (s) => firstPreg(s) || s.deliveries?.v === 0 || (s.pastProblems?.v.includes('C-section') ?? false),
+    }),
+    record: (s) => {
+      if (s.csection) return { value: s.csection.v ? 'Yes, C-section before (check)' : 'No', danger: false };
+      if (s.pastProblems?.v.includes('C-section')) return { value: 'Yes, C-section before (check)', danger: false };
+      if (firstPreg(s)) return { value: 'None: first pregnancy', danger: false };
+      if (s.deliveries?.v === 0) return { value: 'No (no previous deliveries)', danger: false };
+      return { value: s.unknown.has('csection') ? 'Not known' : 'Not clear', danger: false };
+    },
+  },
   // ---- first visit: existing health conditions -----------------------------------------
   conditions: listSpec('conditions', [['HTN', 'High BP'], ['DIABETES', 'Diabetes'], ['HEART', 'Heart disease'], ['ASTHMA', 'Asthma'], ['THYROID', 'Thyroid']], { history: true }),
   longIllness: listSpec('longIllness', [['TB', 'TB'], ['FITS', 'Epilepsy']], { history: true }),
@@ -471,18 +538,25 @@ export const SPECS: Record<string, Spec> = {
     fill(c) {
       if (!c.current) return;
       const meds: string[] = [];
-      if (pol(c, 'IRON') === 1) meds.push('Iron');
+      // Iron only when SAID ("ಕಬ್ಬಿಣ", "iron", "आयरन"): the IRON concept also holds the
+      // generic "tablet" words (right for "taking your iron tablets?", wrong here:
+      // "the white tablet the doctor gave" is not iron)
+      if (pol(c, 'IRON') === 1 && IRON_WORD.test(c.f.text)) meds.push('Iron');
       if (/calcium|ಕ್ಯಾಲ್ಸಿ|कैल्शियम/.test(c.f.text)) meds.push('Calcium');
       if (/folic|ಫೋಲಿಕ್|फोलिक/.test(c.f.text)) meds.push('Folic acid');
       if (pol(c, 'THYROID') === 1) meds.push('Thyroid');
       if (pol(c, 'DIABETES') === 1) meds.push('Sugar');
       if (pol(c, 'HTN') === 1) meds.push('BP');
-      if (!meds.length && (pol(c, 'MEDICINE') === 1 || c.f.global === 'yes')) meds.push('Yes (not named: check)');
       if (meds.length) set(c, 'medicines', meds);
       else if (plainNoOf(c) || pol(c, 'MEDICINE') === -1) set(c, 'medicines', []);
       else if (c.f.global === 'unknown') c.s.unknown.add('medicines');
+      // after "Which ones?": her words as said
+      else if (c.s.vagueYes.has('medicines') && c.f.raw.trim()) set(c, 'medicines', [saidAs(c)]);
+      // "yes, I take them" with no name (field log: "ತೆಗೆದ್ಕೊತಿದ್ದೀನಿ ಹೌದು"): "Which ones?"
+      else if (pol(c, 'MEDICINE') === 1 || pol(c, 'IRON') === 1 || c.f.global === 'yes') c.s.vagueYes.add('medicines');
     },
     done: (s) => !!s.medicines || s.unknown.has('medicines'),
+    follow: (s) => (!s.medicines && s.vagueYes.has('medicines') ? { key: 'vAskWhichOnes' } : null),
     record: (s) => ({ value: s.medicines?.v.length ? s.medicines.v.join(', ') : s.medicines ? 'No medicines' : 'Not known', danger: false }),
   },
   allergy: yesNoSpec('allergy', ['ALLERGY'], 'Yes, allergy (check)', 'No allergies', { history: true }),
@@ -638,7 +712,7 @@ function presentSigns(f: Facts, weeks?: number): Sign[] {
  * transcript and next() to know which question comes now.
  */
 export class Intake {
-  readonly slots: Slots = { signs: {}, reported: new Map(), unknown: new Set(), vagueYes: new Set() };
+  readonly slots: Slots = { signs: {}, reported: new Map(), unknown: new Set(), vagueYes: new Set(), stillVague: new Set() };
   readonly questions: Question[];
   private attempts = new Map<string, number>();
   private answered = new Set<string>();
@@ -677,6 +751,20 @@ export class Intake {
     if (complete) this.answered.add(qid);
     const prefilled = this.questions.filter((q) => q.id !== qid && !before.has(q.id) && !this.answered.has(q.id) && this.skippable(q.id)).map((q) => q.id);
     return { complete, record: this.record(qid, transcript), prefilled, reported: this.slots.reported.get(qid) ?? [] };
+  }
+
+  /**
+   * Would this transcript complete question `qid`? The same reading as
+   * answer(), on a COPY of the slots: nothing is recorded, nothing counted.
+   * The engine asks it of a speculative transcript to end a turn without
+   * waiting out the silence (never for a danger question: see engine.ts).
+   */
+  wouldComplete(qid: string, transcript: string, expect?: Expect): boolean {
+    const spec = SPECS[qid];
+    if (!spec) return true;
+    const s: Slots = { ...this.slots, signs: { ...this.slots.signs }, reported: new Map(this.slots.reported), unknown: new Set(this.slots.unknown), vagueYes: new Set(this.slots.vagueYes), stillVague: new Set(this.slots.stillVague) };
+    spec.fill({ f: extract(transcript), s, q: qid, current: true, expect, weeks: this.weeks });
+    return spec.done(s);
   }
 
   /** Asked twice and still not filled: record it as it stands and move on. */

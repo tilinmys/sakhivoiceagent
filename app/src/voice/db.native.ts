@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
-import type { Diagnostics, OutboxRow, SessionRow, TurnRow, VoiceDb } from './db-types';
+import type { AnswerRow, Diagnostics, OutboxRow, SessionRow, TurnRow, VoiceDb } from './db-types';
 
 // Persistence layer (phones): expo-sqlite, available in Expo Go.
 // One database file (sakhi-voice.db), WAL journal (writes never block
@@ -16,6 +16,7 @@ function open() {
     await db.execAsync(`
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 3000;
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY, mother_id TEXT NOT NULL, lang TEXT NOT NULL,
         started_at INTEGER NOT NULL, ended_at INTEGER, status TEXT NOT NULL,
@@ -29,6 +30,12 @@ function open() {
         PRIMARY KEY (session_id, idx)
       );
       CREATE INDEX IF NOT EXISTS turns_outbox ON turns (stt_status) WHERE stt_status IN ('pending', 'offline', 'failed');
+      CREATE TABLE IF NOT EXISTS answers (
+        session_id TEXT NOT NULL, qid TEXT NOT NULL, idx INTEGER NOT NULL,
+        value TEXT NOT NULL, heard TEXT, danger INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL, latency_ms INTEGER, saved_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, qid)
+      );
       CREATE TABLE IF NOT EXISTS events (
         session_id TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, ms INTEGER NOT NULL
       );
@@ -88,6 +95,18 @@ export const voiceDb: VoiceDb = {
   async turns(sessionId) {
     const db = await open();
     return db.getAllAsync<TurnRow>('SELECT * FROM turns WHERE session_id = ? ORDER BY idx', sessionId);
+  },
+  async saveAnswer(a) {
+    const db = await open();
+    await db.runAsync(
+      `INSERT OR REPLACE INTO answers (session_id, qid, idx, value, heard, danger, status, latency_ms, saved_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      a.session_id, a.qid, a.idx, a.value, a.heard, a.danger, a.status, a.latency_ms, Date.now(),
+    );
+  },
+  async answers(sessionId) {
+    const db = await open();
+    return db.getAllAsync<AnswerRow>('SELECT * FROM answers WHERE session_id = ? ORDER BY idx', sessionId);
   },
   async getDiagnostics(): Promise<Diagnostics> {
     const db = await open();

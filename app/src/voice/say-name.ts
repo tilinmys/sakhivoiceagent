@@ -37,7 +37,7 @@ export function sayName(lang: Lang, maxMs = 5000): Listening {
     }
     if (utt.durationMs < 400) return null;
     try {
-      const r = await gateway.stt(utt.toWav(), lang);
+      const r = await gateway.stt(utt.toUpload(), lang);
       return (r.text || r.en).trim() || null;
     } catch {
       return null;

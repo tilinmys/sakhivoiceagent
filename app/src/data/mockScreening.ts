@@ -140,9 +140,45 @@ export const VISIT_QUESTIONS: Record<Visit, string[]> = {
     'bleedDischarge', 'feverPain', 'tobacco', 'concerns',
     'close',
   ],
-  2: ['newProblems', 'bleedFluid', 'warning', 'feverPain', 'movementFelt', 'ifa', 'calcium', 'testsDone', 'followedAdvice', 'close'],
-  3: ['newProblems', 'movement', 'movementLess', 'tummySize', 'bleedLeak', 'warning', 'feverPain', 'breathing', 'ironCalcium', 'deliveryPlace', 'support', 'close'],
+  // Second trimester: the framework's 7 voice questions (tests done / advice
+  // followed are the ASHA's entries from the MCP card, not hers to recall).
+  2: ['newProblems', 'bleedFluid', 'warning', 'feverPain', 'movementFelt', 'ifa', 'calcium', 'close'],
+  // Third trimester: the framework's 8 questions, in its order. Birth
+  // preparedness (delivery place, transport, support person) is the ASHA's
+  // manual entry, as is the abdominal examination.
+  3: ['newProblems', 'movement', 'movementLess', 'bleedLeak', 'tummySize', 'feverPain', 'breathing', 'ironCalcium', 'close'],
 };
+
+/**
+ * The questionnaire as the ANC framework lays it out, per visit: its section
+ * headings, and the questions under each in asking order (the check-in screen
+ * shows this to the ASHA before Sakhi starts). `ifNeeded`: asked only when an
+ * earlier answer calls for it (history questions after "first pregnancy: no";
+ * "fewer movements?" when "moving as usual?" did not settle it).
+ */
+export type SectionKey = 'secPersonal' | 'secHistory' | 'secConditions' | 'secCurrent' | 'secSinceLast' | 'secWarning' | 'secBaby' | 'secMeds';
+export const VISIT_SECTIONS: Record<Visit, { title: SectionKey; ids: string[] }[]> = {
+  1: [
+    { title: 'secPersonal', ids: ['name', 'age', 'village', 'firstPregnancy', 'prevPregnancies'] },
+    { title: 'secHistory', ids: ['lmp', 'regularPeriods', 'confirmed', 'deliveries', 'losses', 'pastProblems', 'csection'] },
+    { title: 'secConditions', ids: ['conditions', 'longIllness', 'medicines', 'allergy', 'transfusion'] },
+    { title: 'secCurrent', ids: ['bleedDischarge', 'feverPain', 'tobacco', 'concerns'] },
+  ],
+  2: [
+    { title: 'secSinceLast', ids: ['newProblems'] },
+    { title: 'secWarning', ids: ['bleedFluid', 'warning', 'feverPain'] },
+    { title: 'secBaby', ids: ['movementFelt'] },
+    { title: 'secMeds', ids: ['ifa', 'calcium'] },
+  ],
+  3: [
+    { title: 'secSinceLast', ids: ['newProblems'] },
+    { title: 'secBaby', ids: ['movement', 'movementLess'] },
+    { title: 'secWarning', ids: ['bleedLeak', 'tummySize', 'feverPain', 'breathing'] },
+    { title: 'secMeds', ids: ['ironCalcium'] },
+  ],
+};
+/** Asked only when an earlier answer calls for it. */
+export const IF_NEEDED: ReadonlySet<string> = new Set(['prevPregnancies', 'deliveries', 'losses', 'pastProblems', 'csection', 'movementLess']);
 
 const BY_ID = new Map(QUESTION_BANK.map((q) => [q.id, q]));
 
@@ -259,13 +295,13 @@ export const SAKHI_REPLIES: Record<Lang, { ok: string; danger: string; done: str
     urgent: 'This is a danger sign. I am pausing the questions. Please get her checked by a doctor now.',
   },
   kn: {
-    ok: 'ಧನ್ಯವಾದಗಳು, ದಾಖಲಿಸಿಕೊಂಡೆ.',
+    ok: 'ಸರಿ.',
     danger: 'ಇದು ಅಪಾಯದ ಲಕ್ಷಣ. ವೈದ್ಯರಿಗಾಗಿ ಗುರುತಿಸಿದ್ದೇನೆ.',
     done: 'ಎಲ್ಲಾ ಪ್ರಶ್ನೆಗಳು ಮುಗಿದಿವೆ. ಸಾರಾಂಶ ಸಿದ್ಧಪಡಿಸುತ್ತಿದ್ದೇನೆ.',
     urgent: 'ಇದು ಅಪಾಯದ ಲಕ್ಷಣ. ಪ್ರಶ್ನೆಗಳನ್ನು ನಿಲ್ಲಿಸುತ್ತಿದ್ದೇನೆ. ದಯವಿಟ್ಟು ಈಗಲೇ ವೈದ್ಯರಿಂದ ಪರೀಕ್ಷೆ ಮಾಡಿಸಿ.',
   },
   hi: {
-    ok: 'धन्यवाद, दर्ज कर लिया।',
+    ok: 'ठीक है।',
     danger: 'यह खतरे का संकेत है। मैंने डॉक्टर के लिए इसे चिह्नित कर दिया है।',
     done: 'सभी प्रश्न पूरे हो गए। मैं सारांश तैयार कर रही हूँ।',
     urgent: 'यह खतरे का संकेत है। मैं सवाल रोक रही हूँ। कृपया अभी डॉक्टर से जांच करवाएं।',
